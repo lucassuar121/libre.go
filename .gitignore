@@ -1,0 +1,8 @@
+target/
+data/
+*.log
+application-local.properties
+.env
+.idea/
+target/
+data/
