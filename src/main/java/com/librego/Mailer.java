@@ -1,6 +1,8 @@
 package com.librego;
 
 import jakarta.mail.internet.MimeMessage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.mail.javamail.JavaMailSender;
@@ -11,8 +13,11 @@ import org.springframework.stereotype.Service;
 /** Único punto de envío de emails (recuperación de contraseña y facturas). Usa la configuración SMTP de Gmail. */
 @Service
 public class Mailer {
+    private static final Logger LOG = LoggerFactory.getLogger(Mailer.class);
     private final JavaMailSender sender;
     @Value("${spring.mail.username:}") private String from;
+    /** Solo para desarrollo: si el email no está configurado, muestra el contenido (por ejemplo el enlace de recuperación). En producción es false. */
+    @Value("${app.mail.log-content:false}") private boolean logContent;
 
     public Mailer(JavaMailSender sender) { this.sender = sender; }
 
@@ -22,7 +27,8 @@ public class Mailer {
     @Async
     public void send(String to, String subject, String text, String html, String attName, byte[] att) {
         if (!configured()) {
-            System.out.println("[Libre.go] (email NO configurado, no se envió) Para: " + to + " | Asunto: " + subject + "\n" + text);
+            if (logContent) LOG.info("(email NO configurado, no se envió) Para: {} | Asunto: {}\n{}", to, subject, text);
+            else LOG.warn("Email no configurado: no se envió \"{}\".", subject);
             return;
         }
         try {
@@ -35,7 +41,7 @@ public class Mailer {
             if (att != null) h.addAttachment(attName, new ByteArrayResource(att));
             sender.send(m);
         } catch (Exception e) {
-            System.out.println("[Libre.go] No se pudo enviar el email a " + to + ": " + e.getMessage());
+            LOG.warn("No se pudo enviar el email \"{}\": {}", subject, e.getMessage());
         }
     }
 }

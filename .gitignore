@@ -4,5 +4,4 @@ data/
 application-local.properties
 .env
 .idea/
-target/
-data/
+libre-go/
