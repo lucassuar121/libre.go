@@ -36,7 +36,7 @@ public class CompanyPurger {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public boolean markExpired(Long id) {
         Company c = cos.findWithLockById(id).orElse(null);
-        if (c == null || !"ACTIVA".equals(c.subStatus)) return false;
+        if (c == null || Boolean.TRUE.equals(c.demo) || !"ACTIVA".equals(c.subStatus)) return false;
         if (c.subExpires != null && Instant.now().isBefore(c.subExpires)) return false;
         c.subStatus = "VENCIDA";
         cos.save(c);
@@ -51,7 +51,7 @@ public class CompanyPurger {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public boolean purgeIfDue(Long id, long graceDays) {
         Company c = cos.findWithLockById(id).orElse(null);
-        if (c == null) return false; // ya eliminada: no se repite
+        if (c == null || Boolean.TRUE.equals(c.demo)) return false; // ya eliminada o empresa demo protegida
         Instant now = Instant.now();
         if (c.subCancelRequestedAt == null || c.subCancelConfirmedAt == null || c.subExpires == null) return false;
         if (now.isBefore(c.subExpires.plusSeconds(graceDays * 86400L))) return false;

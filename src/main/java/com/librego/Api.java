@@ -52,6 +52,10 @@ public class Api {
     private final SubscriptionJobs jobs;
     private final MercadoPagoClient mp;
     private final SignupIntents signupIntents;
+    private final DemoSeeder demoSeeder;
+    private final FiscalConfigs fiscalConfigs;
+    private final FiscalInvoices fiscalInvoices;
+    private final ArcaService arca;
     private final BCryptPasswordEncoder enc = new BCryptPasswordEncoder();
     private final SecureRandom rnd = new SecureRandom();
     @Value("${app.base-url}") private String baseUrl;
@@ -66,8 +70,8 @@ public class Api {
     @Value("${app.subscription.delete-grace-days:0}") private long deleteGraceDays;
     private final Map<String, List<Instant>> hits = new java.util.concurrent.ConcurrentHashMap<>();
 
-    public Api(Companies cos, Users users, Recs recs, ObjectMapper om, Mailer mailer, HttpServletRequest req, Payments pays, Audits audits, AuditService audit, SubscriptionJobs jobs, MercadoPagoClient mp, SignupIntents signupIntents) {
-        this.cos = cos; this.users = users; this.recs = recs; this.om = om; this.mailer = mailer; this.req = req; this.pays = pays; this.audits = audits; this.audit = audit; this.jobs = jobs; this.mp = mp; this.signupIntents = signupIntents;
+    public Api(Companies cos, Users users, Recs recs, ObjectMapper om, Mailer mailer, HttpServletRequest req, Payments pays, Audits audits, AuditService audit, SubscriptionJobs jobs, MercadoPagoClient mp, SignupIntents signupIntents, DemoSeeder demoSeeder, FiscalConfigs fiscalConfigs, FiscalInvoices fiscalInvoices, ArcaService arca) {
+        this.cos = cos; this.users = users; this.recs = recs; this.om = om; this.mailer = mailer; this.req = req; this.pays = pays; this.audits = audits; this.audit = audit; this.jobs = jobs; this.mp = mp; this.signupIntents = signupIntents; this.demoSeeder = demoSeeder; this.fiscalConfigs = fiscalConfigs; this.fiscalInvoices = fiscalInvoices; this.arca = arca;
     }
 
     // ---------- utilidades ----------
@@ -208,6 +212,7 @@ public class Api {
     Map<String, Object> rd(Rec r) {
         try {
             Map<String, Object> m = new LinkedHashMap<>(om.readValue(r.payload, new TypeReference<Map<String, Object>>() {}));
+            if ("products".equals(r.kind)) m.putIfAbsent("ivaRate", 21.0);
             m.put("id", r.id);
             return m;
         } catch (Exception e) { throw new RuntimeException(e); }
@@ -310,6 +315,15 @@ public class Api {
         c.subExpires = c.subStart.atZone(ZoneId.of(tz)).plusMonths(1).toInstant(); c.mpPreapprovalId = in.mpPreapprovalId;
         c.mpSubRef = in.externalReference; c.mpPreapprovalStatus = in.mpStatus; c.mpSubAmount = in.amount;
         c = cos.save(c);
+        int counters = (int)Math.max(1, Math.min(50, Math.round(dbl(b.get("counters")))));
+        List<?> balancesRaw = b.get("cashBalances") instanceof List<?> ? (List<?>) b.get("cashBalances") : List.of();
+        List<Double> balances = new ArrayList<>();
+        for (int idx = 0; idx < counters; idx++) {
+            double amount = idx < balancesRaw.size() ? dbl(balancesRaw.get(idx)) : 0;
+            if (amount < 0 || amount > 1000000000d) throw err(400, "El saldo inicial de cada mostrador debe ser un importe válido y no negativo.");
+            balances.add(amount);
+        }
+        mk(c.id, "companyconfig", new LinkedHashMap<>(Map.of("counters", counters, "cashBalances", balances)));
         AppUser u = new AppUser(); u.companyId = c.id; u.name = name; u.username = un; u.email = em; u.passHash = enc.encode(pw); u.role = "jefe";
         u = users.save(u);
         Payment p = new Payment(); p.companyId = c.id; p.companyName = c.name; p.reference = "SIGNUP-PAY-" + in.mpPaymentId;
@@ -321,6 +335,34 @@ public class Api {
         return bootFor(u);
     }
 
+    /** Cambia entre las cuentas demo solo dentro de una sesión que ya inició sesión con una cuenta demo. */
+    @PostMapping("/public/demo/login")
+    public Map<String, Object> demoLogin(@RequestBody(required = false) Map<String,Object> body, HttpSession s) {
+        if (!Boolean.TRUE.equals(s.getAttribute("demoGate"))) {
+            throw err(403, "Iniciá sesión con una de las cuentas de demostración para usar esta función.");
+        }
+        Company demo = cos.findAll().stream().filter(c -> Boolean.TRUE.equals(c.demo)).findFirst()
+                .orElseThrow(() -> err(503, "La demostración todavía no está preparada."));
+        String role = str(body == null ? null : body.get("role")).equals("empleado") ? "empleado" : "jefe";
+        AppUser u = users.findByCompanyId(demo.id).stream().filter(x -> role.equals(x.role))
+                .sorted(Comparator.comparing(x -> x.username)).findFirst()
+                .orElseThrow(() -> err(503, "La cuenta de demostración no está preparada."));
+        req.changeSessionId(); s.setAttribute("demoGate", true); s.setAttribute("uid", u.id);
+        return bootFor(u);
+    }
+
+    /** Restaura exclusivamente los registros ficticios de la empresa demo. */
+    @PostMapping("/public/demo/reset")
+    public Map<String, Object> resetDemo(HttpSession s) {
+        if (!Boolean.TRUE.equals(s.getAttribute("demoGate"))) throw err(403, "Ingresá primero con las credenciales privadas de demostración.");
+        AppUser u = me(s);
+        Company c = cos.findById(u.companyId).orElseThrow(() -> err(404, "Empresa no encontrada."));
+        if (!Boolean.TRUE.equals(c.demo)) throw err(403, "Esta acción solo está disponible en la demostración.");
+        if (!isBoss(u)) throw err(403, "Solo el jefe de la demostración puede restaurarla.");
+        demoSeeder.reset(c.id);
+        return ok();
+    }
+
     @PostMapping("/auth/login")
     public Map<String, Object> login(@RequestBody Map<String, Object> b, HttpSession s) {
         String un = str(b.get("username")).toLowerCase(), ukey = "login|" + ip() + "|" + un, ikey = "loginip|" + ip();
@@ -330,9 +372,27 @@ public class Api {
             hit(ukey); hit(ikey);
             throw err(400, "Usuario o contraseña incorrectos.");
         }
+        boolean demoAccount = u.companyId != null && cos.findById(u.companyId)
+                .map(c -> Boolean.TRUE.equals(c.demo)).orElse(false);
         hits.remove(ukey);
         req.changeSessionId(); // evita la fijación de sesión
+        // Las cuentas demo se usan desde el formulario normal de inicio de sesión; no hay un acceso público especial.
+        // La marca de sesión habilita las acciones propias de la demo (restaurar datos/cambiar rol), no datos de otras empresas.
+        if (demoAccount) s.setAttribute("demoGate", true);
         s.setAttribute("uid", u.id);
+        // El jefe no ficha ni ocupa mostrador. Cierra administrativamente cualquier fichaje antiguo accidental.
+        if (isBoss(u) && u.companyId != null) {
+            for (Map<String,Object> oldShift : list(u.companyId, "shifts")) {
+                if (num(oldShift.get("userId")) == u.id && oldShift.get("end") == null) {
+                    Rec sr = find(u.companyId, "shifts", oldShift.get("id"));
+                    oldShift.put("end", Instant.now().toString());
+                    oldShift.put("counter", null);
+                    oldShift.put("bossNoCounter", true);
+                    oldShift.put("adminClosed", true);
+                    wr(sr, oldShift);
+                }
+            }
+        }
         if (isGlobal(u)) return globalBoot(u);
         if ("global".equals(u.role)) throw err(403, "Acceso denegado.");
         log(u, "Inició sesión");
@@ -433,7 +493,7 @@ public class Api {
             names.put(c.id, c.name);
             List<Map<String, Object>> sl = list(c.id, "sales");
             Map<String, Object> o = new LinkedHashMap<>();
-            o.put("id", c.id); o.put("name", c.name);
+            o.put("id", c.id); o.put("name", c.name); o.put("demo", Boolean.TRUE.equals(c.demo));
             o.put("users", users.findByCompanyId(c.id).size());
             o.put("products", recs.findByCompanyIdAndKind(c.id, "products").size());
             o.put("clients", recs.findByCompanyIdAndKind(c.id, "clients").size());
@@ -465,31 +525,36 @@ public class Api {
         Long c = u.companyId;
         boolean boss = isBoss(u);
         List<Map<String, Object>> sales = list(c, "sales");
-        List<Map<String, Object>> shifts = list(c, "shifts");
+        List<Map<String, Object>> shifts = list(c, "shifts").stream().filter(x -> !Boolean.TRUE.equals(x.get("bossNoCounter"))).collect(Collectors.toList());
         if (!boss) shifts = shifts.stream().filter(x -> num(x.get("userId")) == u.id && x.get("end") == null).collect(Collectors.toList());
-        addCash(shifts, sales); // la caja se calcula con todas las ventas, antes de filtrar lo que ve el empleado
+        List<Map<String, Object>> purchases = list(c, "purchases");
+        List<Map<String, Object>> withdrawals = list(c, "withdrawals");
+        addCash(shifts, sales, purchases, withdrawals); // ventas, compras y retiros asociados a cada turno
         if (!boss) { // empleado: solo las ventas de SU turno actual y del DÍA actual (cualquier mostrador del mismo turno)
             Map<String, Object> open = shifts.stream().filter(x -> x.get("end") == null).findFirst().orElse(null);
             LocalDate today = LocalDate.now(ZoneId.of(tz));
             sales = sales.stream().filter(x -> open != null && today.equals(dayOf(x.get("at"))) && sameTurn(open, x)).collect(Collectors.toList());
         }
         List<Map<String, Object>> prods = list(c, "products");
-        if (!boss) { // el empleado no ve costos ni ganancias
-            prods.forEach(p -> p.remove("buyPrice"));
+        if (!boss) { // el empleado no ve ganancias históricas; el costo unitario sí se necesita para registrar compras
             sales.forEach(x -> ((List<Map<String, Object>>) x.get("items")).forEach(i -> i.remove("cost")));
         }
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("me", pub(u));
         m.put("company", cos.findById(c).map(x -> x.name).orElse(""));
-        cos.findById(c).ifPresent(co -> m.put("subscription", subInfo(co, boss)));
+        cos.findById(c).ifPresent(co -> { m.put("subscription", subInfo(co, boss)); m.put("demo", Boolean.TRUE.equals(co.demo)); });
         m.put("products", prods);
         m.put("clients", list(c, "clients"));
         m.put("suppliers", list(c, "suppliers"));
         m.put("sales", sales);
         m.put("moves", boss ? list(c, "moves") : new ArrayList<>()); // el historial de movimientos es solo del jefe
-        m.put("purchases", boss ? list(c, "purchases") : new ArrayList<>());
+        m.put("purchases", list(c, "purchases"));
         m.put("tz", tz);
         m.put("shifts", shifts);
+        Set<Long> visibleShiftIds = shifts.stream().map(x -> num(x.get("id"))).collect(Collectors.toSet());
+        m.put("withdrawals", boss ? withdrawals : withdrawals.stream().filter(x -> visibleShiftIds.contains(num(x.get("shiftId")))).collect(Collectors.toList()));
+        Map<String,Object> companyConfig = list(c, "companyconfig").stream().findFirst().orElse(Map.of("counters",1,"cashBalances",List.of(0)));
+        m.put("counterConfig", companyConfig);
         List<Map<String, Object>> defs = list(c, "shiftdefs");
         if (!boss) defs = defs.stream().filter(x -> Boolean.TRUE.equals(x.get("active"))).collect(Collectors.toList());
         defs.sort((x, y) -> str(x.get("from")).compareTo(str(y.get("from"))));
@@ -499,23 +564,36 @@ public class Api {
         m.put("log", new ArrayList<>());
         if (boss) {
             m.put("users", users.findByCompanyId(c).stream().map(this::pub).collect(Collectors.toList()));
-            m.put("log", recs.findTop300ByCompanyIdAndKindOrderByIdDesc(c, "log").stream().map(this::rd).collect(Collectors.toList()));
+            m.put("log", recs.findByCompanyIdAndKindOrderByIdDesc(c, "log").stream().map(this::rd).collect(Collectors.toList()));
         }
         return m;
     }
 
-    void addCash(List<Map<String, Object>> shifts, List<Map<String, Object>> sales) {
+    void addCash(List<Map<String, Object>> shifts, List<Map<String, Object>> sales, List<Map<String, Object>> purchases, List<Map<String, Object>> withdrawals) {
         for (Map<String, Object> sh : shifts) {
-            double sold = 0, cash = 0, card = 0, qr = 0;
+            double sold = 0, cash = 0, card = 0, qr = 0, transferIn = 0, cashOut = 0, transferOut = 0, retired = 0;
             int n = 0;
             for (Map<String, Object> x : sales) {
                 if (x.get("shiftId") == null || num(x.get("shiftId")) != num(sh.get("id"))) continue;
-                double t = dbl(x.get("total"));
-                String p = str(x.get("payment"));
+                double t = dbl(x.get("total")); String p = str(x.get("payment"));
                 sold += t; n++;
-                if (p.equals("efectivo")) cash += t; else if (p.equals("tarjeta")) card += t; else qr += t;
+                if (p.equals("efectivo")) cash += t; else if (p.equals("tarjeta")) card += t; else if (p.equals("qr")) qr += t; else if (p.equals("transferencia")) transferIn += t;
             }
-            sh.put("cash", Map.of("sold", sold, "cash", cash, "card", card, "qr", qr, "count", n));
+            for (Map<String, Object> purchase : purchases) {
+                if (!"PAGADA".equals(str(purchase.get("paymentStatus")))) continue;
+                if (purchase.get("cashShiftId") == null || num(purchase.get("cashShiftId")) != num(sh.get("id"))) continue;
+                double amount = dbl(purchase.get("total"));
+                if ("efectivo".equals(str(purchase.get("paymentMethod")))) cashOut += amount;
+                else if ("transferencia".equals(str(purchase.get("paymentMethod")))) transferOut += amount;
+            }
+            for (Map<String,Object> w : withdrawals) if (w.get("shiftId") != null && num(w.get("shiftId")) == num(sh.get("id"))) retired += dbl(w.get("amount"));
+            double opening = dbl(sh.get("openingCash"));
+            double expected = opening + cash - cashOut - retired;
+            Map<String,Object> totals = new LinkedHashMap<>();
+            totals.put("sold", sold); totals.put("cash", cash); totals.put("card", card); totals.put("qr", qr); totals.put("transfer", transferIn); totals.put("count", n);
+            totals.put("cashOut", cashOut); totals.put("transferOut", transferOut); totals.put("withdrawals", retired);
+            totals.put("openingCash", opening); totals.put("cashNet", expected); totals.put("expectedCash", expected);
+            sh.put("cash", totals);
         }
     }
 
@@ -537,6 +615,7 @@ public class Api {
         AppUser g = global(s);
         if (b == null || !Boolean.TRUE.equals(b.get("confirm"))) throw err(400, "Falta la confirmación para eliminar la empresa.");
         Company c = cos.findById(id).orElseThrow(() -> err(404, "La empresa no existe."));
+        if (Boolean.TRUE.equals(c.demo)) throw err(400, "La empresa de demostración no se puede eliminar desde este panel.");
         List<AppUser> us = users.findByCompanyId(c.id);
         if (us.stream().anyMatch(x -> x.id.equals(g.id) || "global".equals(x.role))) throw err(400, "Esta empresa no se puede eliminar.");
         recs.deleteByCompanyId(c.id);
@@ -577,10 +656,10 @@ public class Api {
 
     // ---------- productos, clientes, proveedores ----------
     static final Map<String, List<String>> F = Map.of(
-            "products", List.of("type", "title", "author", "isbn", "category", "buyPrice", "sellPrice", "stock"),
+            "products", List.of("type", "title", "author", "isbn", "category", "buyPrice", "sellPrice", "ivaRate", "stock"),
             "clients", List.of("name", "email", "phone"),
             "suppliers", List.of("name", "contact", "phone", "email", "website"));
-    static final Set<String> NUM = Set.of("buyPrice", "sellPrice", "stock");
+    static final Set<String> NUM = Set.of("buyPrice", "sellPrice", "ivaRate", "stock");
     static final Map<String, String> LAB = Map.of("products", "producto", "clients", "cliente", "suppliers", "proveedor");
 
     void chk(String kind) { if (!F.containsKey(kind)) throw err(404, "No existe."); }
@@ -590,16 +669,23 @@ public class Api {
         Map<String, Object> m = old == null ? new LinkedHashMap<>() : new LinkedHashMap<>(old);
         for (String f : F.get(kind)) {
             if (!b.containsKey(f)) continue;
-            if (f.equals("buyPrice") && !isBoss(u) && old != null) continue; // el empleado no modifica costos existentes
+            if (f.equals("buyPrice") && !isBoss(u) && old != null) continue; // el empleado no modifica costos de productos existentes
             Object v;
             if (f.equals("stock")) v = Math.max(0L, Math.round(dbl(b.get(f))));
-            else if (NUM.contains(f)) v = Math.max(0.0, dbl(b.get(f)));
-            else v = str(b.get(f));
+            else if (NUM.contains(f)) {
+                double n = dbl(b.get(f));
+                if ((f.equals("buyPrice") || f.equals("sellPrice")) && (!Double.isFinite(n) || n != Math.rint(n))) throw err(400, "Los precios de compra y venta deben ser números enteros, sin puntos ni comas.");
+                v = Math.max(0.0, n);
+            } else v = str(b.get(f));
             m.put(f, v);
         }
         if (kind.equals("products")) {
-            if (!"otro".equals(m.get("type"))) m.put("type", "libro");
-            m.putIfAbsent("buyPrice", 0.0); m.putIfAbsent("sellPrice", 0.0); m.putIfAbsent("stock", 0L);
+            String customType = cut(str(m.get("type")).trim(), 60);
+            if (customType.isEmpty()) customType = "libro";
+            m.put("type", customType);
+            m.putIfAbsent("buyPrice", 0.0); m.putIfAbsent("sellPrice", 0.0); m.putIfAbsent("ivaRate", 21.0); m.putIfAbsent("stock", 0L);
+            double vat = dbl(m.get("ivaRate"));
+            if (!Double.isFinite(vat) || vat < 0 || vat > 100) throw err(400, "La alícuota de IVA debe estar entre 0 y 100.");
         }
         if (str(m.get(kind.equals("products") ? "title" : "name")).isEmpty()) throw err(400, "Completá el nombre.");
         return m;
@@ -620,6 +706,7 @@ public class Api {
     public Map<String, Object> update(@PathVariable String kind, @PathVariable Long id, @RequestBody Map<String, Object> b, HttpSession s) {
         AppUser u = me(s);
         chk(kind);
+        if (kind.equals("products") && !isBoss(u)) throw err(403, "Solo el jefe puede editar productos. El empleado puede registrar movimientos de stock.");
         if (kind.equals("products")) lockCompany(u.companyId);
         Rec r = find(u.companyId, kind, id);
         Map<String, Object> old = rd(r);
@@ -656,6 +743,8 @@ public class Api {
     @PostMapping("/stock/new")
     public Map<String, Object> stockNew(@RequestBody Map<String, Object> b, HttpSession s) {
         AppUser u = me(s);
+        // Jefes y empleados pueden dar de alta productos nuevos; la edición y eliminación
+        // de productos existentes sigue restringida al jefe.
         lockCompany(u.companyId);
         long units = Math.round(dbl(b.get("units")));
         long boxes = Math.round(dbl(b.get("boxes"))), perBox = Math.round(dbl(b.get("perBox")));
@@ -669,6 +758,31 @@ public class Api {
         Map<String, Object> m = clean("products", b, u, null);
         Rec r = mk(u.companyId, "products", m);
         move(u, r.id, str(m.get("title")), "entrada", units, 0, units, detail);
+        // El alta con stock también deja un registro de ingreso/compra y, si se pagó en efectivo,
+        // lo vincula a una caja abierta para que el egreso se refleje en el saldo del turno.
+        String paymentMethod = str(b.get("paymentMethod")).toLowerCase(Locale.ROOT);
+        if (!paymentMethod.isEmpty()) {
+            if (!Set.of("efectivo", "pendiente").contains(paymentMethod)) throw err(400, "Elegí efectivo o cuenta corriente / pendiente.");
+            Long cashShiftId = null;
+            if (paymentMethod.equals("efectivo")) {
+                if (str(b.get("cashShiftId")).isBlank()) throw err(400, "Seleccioná la caja de la que sale el efectivo.");
+                long shiftId = num(b.get("cashShiftId"));
+                Map<String,Object> shift = list(u.companyId,"shifts").stream().filter(x -> num(x.get("id")) == shiftId && x.get("end") == null).findFirst().orElseThrow(() -> err(400,"La caja elegida no existe o ya está cerrada."));
+                cashShiftId = num(shift.get("id"));
+            }
+            double unitCost = dbl(m.get("buyPrice"));
+            double total = unitCost * units;
+            List<Map<String,Object>> existingPurchases = list(u.companyId,"purchases");
+            Map<String,Object> purchase = new LinkedHashMap<>();
+            purchase.put("number", existingPurchases.size()+1); purchase.put("date", LocalDate.now(ZoneId.of(tz)).toString());
+            purchase.put("at", Instant.now().toString()); purchase.put("supplierId", null); purchase.put("supplierName", "Ingreso inicial de stock");
+            purchase.put("invoice", ""); purchase.put("notes", "Compra generada al dar de alta el producto.");
+            purchase.put("items", List.of(Map.of("productId",r.id,"title",str(m.get("title")),"qty",units,"unitPrice",unitCost,"subtotal",total)));
+            purchase.put("total",total); purchase.put("status","REGISTRADA"); purchase.put("requestId","alta-producto-"+u.companyId+"-"+r.id);
+            purchase.put("paymentMethod",paymentMethod); purchase.put("paymentStatus",paymentMethod.equals("efectivo")?"PAGADA":"PENDIENTE");
+            purchase.put("paidAt",paymentMethod.equals("efectivo")?Instant.now().toString():null); if(cashShiftId!=null)purchase.put("cashShiftId",cashShiftId);
+            purchase.put("userId",u.id); purchase.put("user",u.name); mk(u.companyId,"purchases",purchase);
+        }
         log(u, "Ingresó producto nuevo: " + m.get("title") + " (" + units + " u.)");
         return ok();
     }
@@ -707,6 +821,119 @@ public class Api {
         return ok();
     }
 
+    // ---------- configuración fiscal y facturación electrónica ARCA ----------
+    @GetMapping("/fiscal/config")
+    public Map<String, Object> fiscalConfig(HttpSession s) {
+        AppUser u = boss(s);
+        Company company = cos.findById(u.companyId).orElseThrow(() -> err(404, "Empresa no encontrada."));
+        if (Boolean.TRUE.equals(company.demo)) throw err(403, "La facturación fiscal está deshabilitada en la demostración.");
+        FiscalConfig cfg = fiscalConfigs.findByCompanyId(u.companyId).orElse(null);
+        Map<String,Object> out = new LinkedHashMap<>();
+        out.put("configured", cfg != null);
+        out.put("certificateConfigured", cfg != null && cfg.encryptedPkcs12 != null && !cfg.encryptedPkcs12.isBlank());
+        if (cfg != null) { out.put("cuit", cfg.cuit); out.put("legalName", cfg.legalName); out.put("ivaCondition", cfg.ivaCondition); out.put("pointOfSale", cfg.pointOfSale); out.put("environment", cfg.environment); out.put("updatedAt", cfg.updatedAt); }
+        return out;
+    }
+
+    @PutMapping("/fiscal/config")
+    public Map<String, Object> saveFiscalConfig(@RequestBody Map<String,Object> b, HttpSession s) {
+        AppUser u = boss(s);
+        Company company = cos.findById(u.companyId).orElseThrow(() -> err(404, "Empresa no encontrada."));
+        if (Boolean.TRUE.equals(company.demo)) throw err(403, "La facturación fiscal está deshabilitada en la demostración.");
+        String cuit = str(b.get("cuit")).replaceAll("[^0-9]", "");
+        if (!validCuit(cuit)) throw err(400, "Ingresá un CUIT válido de 11 dígitos.");
+        String legalName = str(b.get("legalName"));
+        if (legalName.isBlank() || legalName.length() > 150) throw err(400, "Completá la razón social (máximo 150 caracteres).");
+        String iva = str(b.get("ivaCondition")).toUpperCase(Locale.ROOT);
+        if (!Set.of("RESPONSABLE_INSCRIPTO", "MONOTRIBUTO", "EXENTO").contains(iva)) throw err(400, "Elegí una condición fiscal válida.");
+        int point;
+        try { point = Integer.parseInt(str(b.get("pointOfSale"))); } catch(Exception e) { throw err(400, "Ingresá el punto de venta habilitado para web service."); }
+        if (point < 1 || point > 99999) throw err(400, "El punto de venta debe estar entre 1 y 99999.");
+        String env = str(b.get("environment")).toUpperCase(Locale.ROOT);
+        if (!Set.of("HOMOLOGACION", "PRODUCCION").contains(env)) throw err(400, "Elegí homologación o producción.");
+        FiscalConfig cfg = fiscalConfigs.findByCompanyId(u.companyId).orElseGet(FiscalConfig::new);
+        cfg.companyId = u.companyId; cfg.cuit = cuit; cfg.legalName = legalName; cfg.ivaCondition = iva; cfg.pointOfSale = point; cfg.environment = env;
+        String cert = str(b.get("certificateBase64"));
+        if (!cert.isBlank()) {
+            try { arca.setCertificate(cfg, cert, str(b.get("certificatePassword"))); }
+            catch (IllegalArgumentException e) { throw err(400, e.getMessage()); }
+            catch (IllegalStateException e) { throw err(503, e.getMessage()); }
+        }
+        cfg.updatedAt = Instant.now(); fiscalConfigs.save(cfg);
+        log(u, "Actualizó la configuración fiscal de ARCA (ambiente " + env + ").");
+        return Map.of("ok", true, "certificateConfigured", cfg.encryptedPkcs12 != null && !cfg.encryptedPkcs12.isBlank());
+    }
+
+    @GetMapping("/fiscal/invoices")
+    public List<Map<String,Object>> fiscalInvoiceList(HttpSession s) {
+        AppUser u = me(s);
+        Company company = cos.findById(u.companyId).orElseThrow(() -> err(404, "Empresa no encontrada."));
+        if (Boolean.TRUE.equals(company.demo)) throw err(403, "La facturación fiscal está deshabilitada en la demostración.");
+        return fiscalInvoices.findByCompanyIdOrderByIdDesc(u.companyId).stream().map(this::invoiceView).collect(Collectors.toList());
+    }
+
+    @PostMapping("/fiscal/invoices")
+    public Map<String,Object> issueFiscalInvoice(@RequestBody Map<String,Object> b, HttpSession s) {
+        AppUser u = me(s);
+        Company company = cos.findById(u.companyId).orElseThrow(() -> err(404, "Empresa no encontrada."));
+        if (Boolean.TRUE.equals(company.demo)) throw err(403, "No se pueden emitir facturas fiscales reales desde la demostración.");
+        lockCompany(u.companyId); // serializa la numeración y evita dos facturas concurrentes para la misma venta
+        long saleId;
+        try { saleId = num(b.get("saleId")); } catch(Exception e) { throw err(400, "Seleccioná una venta válida."); }
+        Rec saleRec = find(u.companyId, "sales", saleId);
+        Map<String,Object> sale = rd(saleRec);
+        FiscalInvoice old = fiscalInvoices.findByCompanyIdAndSaleRecordId(u.companyId, saleId).orElse(null);
+        if (old != null && "AUTHORIZED".equals(old.status)) throw err(409, "Esta venta ya tiene una factura autorizada (#"+old.invoiceNumber+").");
+        FiscalConfig cfg = fiscalConfigs.findByCompanyId(u.companyId).orElseThrow(() -> err(400, "Primero completá Configuración fiscal de ARCA."));
+        String buyerName = str(b.get("buyerName"));
+        String buyerDocType = str(b.get("buyerDocType"));
+        String buyerDocNumber = str(b.get("buyerDocNumber"));
+        String buyerIva = str(b.get("buyerIvaCondition"));
+        double ivaRate;
+        try { ivaRate = Double.parseDouble(str(b.get("ivaRate"))); } catch(Exception e) { throw err(400, "Elegí una alícuota de IVA válida."); }
+        if (buyerName.length() > 150 || buyerDocNumber.length() > 20) throw err(400, "Los datos del receptor son demasiado largos.");
+        Object rawItems = sale.get("items");
+        if (rawItems instanceof List<?> lines) {
+            Set<Double> rates = new HashSet<>();
+            for (Object item : lines) if (item instanceof Map<?,?> line && line.get("ivaRate") != null) rates.add(dbl(line.get("ivaRate")));
+            if (rates.size() > 1) throw err(400, "Esta venta tiene productos con distintas alícuotas de IVA. Para evitar una factura incorrecta, separá las ventas por alícuota antes de emitir.");
+            if (rates.size() == 1 && !rates.contains(ivaRate) && !"C".equalsIgnoreCase(str(b.get("invoiceType")))) throw err(400, "La alícuota elegida no coincide con la configurada en los productos de esta venta.");
+        }
+        try {
+            double total = dbl(sale.get("total"));
+            ArcaService.Result result = arca.issue(cfg, str(b.get("invoiceType")), buyerName.isBlank()?str(sale.get("clientName")):buyerName,
+                    buyerDocType, buyerDocNumber, buyerIva, total, ivaRate);
+            FiscalInvoice inv = new FiscalInvoice(); inv.companyId=u.companyId; inv.saleRecordId=saleId; inv.invoiceType=result.invoiceType(); inv.issuerCuit=cfg.cuit; inv.issuerName=cfg.legalName;
+            inv.pointOfSale=result.pointOfSale(); inv.invoiceNumber=result.number(); inv.issueDate=LocalDate.now(ZoneId.of(tz)).toString();
+            inv.buyerName=buyerName.isBlank()?str(sale.get("clientName")):buyerName; inv.buyerDocType=buyerDocType; inv.buyerDocNumber=buyerDocNumber;
+            inv.total=result.total(); inv.netAmount=result.net(); inv.vatAmount=result.vat(); inv.itemsJson=om.writeValueAsString(sale.get("items")); inv.cae=result.cae(); inv.caeExpiration=result.caeExpiration();
+            inv.status="AUTHORIZED"; inv.environment=result.environment(); inv.responseSummary=result.rawSummary(); inv.createdAt=Instant.now();
+            fiscalInvoices.save(inv); log(u, "ARCA autorizó factura "+inv.invoiceType+" "+String.format("%05d-%08d",inv.pointOfSale,inv.invoiceNumber)+" para venta #"+sale.get("number"));
+            return invoiceView(inv);
+        } catch (IllegalArgumentException e) { throw err(400, e.getMessage()); }
+          catch (IllegalStateException e) { LOG.warn("ARCA no autorizó factura para empresa {}: {}", u.companyId, e.getMessage()); throw err(502, e.getMessage()); }
+          catch (Exception e) { LOG.warn("Error de comunicación con ARCA para empresa {}: {}", u.companyId, e.toString()); throw err(502, "No se pudo completar la solicitud a ARCA. Revisá el certificado, la conexión y el ambiente seleccionado."); }
+    }
+
+    @GetMapping(value="/fiscal/invoices/{id}/pdf", produces="application/pdf")
+    public ResponseEntity<byte[]> fiscalInvoicePdf(@PathVariable Long id, HttpSession s) {
+        AppUser u = me(s);
+        FiscalInvoice inv = fiscalInvoices.findById(id).filter(x -> x.companyId.equals(u.companyId) && "AUTHORIZED".equals(x.status)).orElseThrow(() -> err(404, "Factura no encontrada."));
+        Company co = cos.findById(u.companyId).orElseThrow(() -> err(404, "Empresa no encontrada."));
+        try { return ResponseEntity.ok().header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"factura-"+inv.invoiceType+"-"+inv.pointOfSale+"-"+inv.invoiceNumber+".pdf\"").contentType(org.springframework.http.MediaType.APPLICATION_PDF).body(FiscalInvoicePdf.pdf(co.name, inv)); }
+        catch(Exception e) { throw err(500, "No se pudo generar el PDF de la factura."); }
+    }
+
+    private Map<String,Object> invoiceView(FiscalInvoice inv) {
+        Map<String,Object> m=new LinkedHashMap<>(); m.put("id",inv.id);m.put("saleRecordId",inv.saleRecordId);m.put("invoiceType",inv.invoiceType);m.put("issuerCuit",inv.issuerCuit);m.put("issuerName",inv.issuerName);m.put("pointOfSale",inv.pointOfSale);m.put("invoiceNumber",inv.invoiceNumber);m.put("issueDate",inv.issueDate);m.put("buyerName",inv.buyerName);m.put("buyerDocType",inv.buyerDocType);m.put("buyerDocNumber",inv.buyerDocNumber);m.put("total",inv.total);m.put("netAmount",inv.netAmount);m.put("vatAmount",inv.vatAmount);m.put("cae",inv.cae);m.put("caeExpiration",inv.caeExpiration);m.put("status",inv.status);m.put("environment",inv.environment);m.put("createdAt",inv.createdAt==null?null:inv.createdAt.toString());m.put("pdfUrl","/api/fiscal/invoices/"+inv.id+"/pdf");return m;
+    }
+    private boolean validCuit(String cuit) {
+        if (cuit == null || !cuit.matches("\\d{11}")) return false;
+        int[] weights={5,4,3,2,7,6,5,4,3,2}; int sum=0;
+        for(int i=0;i<10;i++)sum+=(cuit.charAt(i)-'0')*weights[i]; int r=11-(sum%11); int dv=r==11?0:r==10?9:r;
+        return dv==cuit.charAt(10)-'0';
+    }
+
     // ---------- ventas ----------
     @SuppressWarnings("unchecked")
     @PostMapping("/sales")
@@ -715,7 +942,7 @@ public class Api {
         Long c = u.companyId;
         lockCompany(c);
         String pay = str(b.get("payment"));
-        if (!Set.of("efectivo", "tarjeta", "qr").contains(pay)) throw err(400, "Elegí el medio de pago.");
+        if (!Set.of("efectivo", "tarjeta", "qr", "transferencia").contains(pay)) throw err(400, "Elegí el medio de pago.");
         String ctype = str(b.get("customerType"));
         if (ctype.isEmpty()) ctype = "nuevo";
         if (!Set.of("registrado", "nuevo", "final").contains(ctype)) throw err(400, "Tipo de cliente inválido.");
@@ -727,16 +954,39 @@ public class Api {
             if (fn.isEmpty() || ln.isEmpty()) throw err(400, "Ingresá nombre y apellido del cliente.");
             if (!em.matches(EMAIL)) throw err(400, "Ingresá un correo electrónico válido para el cliente.");
         }
+        String saleType = str(b.get("saleType"));
+        boolean photocopy = "FOTOCOPIAS".equalsIgnoreCase(saleType) || b.get("photocopy") instanceof Map<?,?>;
+        double total = 0;
         List<Map<String, Object>> lines = (List<Map<String, Object>>) b.get("items");
-        if (lines == null || lines.isEmpty()) throw err(400, "Agregá al menos un producto.");
+        Map<String,Object> copyDetails = b.get("photocopy") instanceof Map<?,?> ? (Map<String,Object>)b.get("photocopy") : new LinkedHashMap<>();
+        if (lines == null) lines = new ArrayList<>();
+        if (lines.isEmpty() && !photocopy) throw err(400, "Agregá al menos un producto o un trabajo de fotocopias.");
+        if (photocopy) {
+            long pages = Math.round(dbl(copyDetails.get("pages"))), copies = Math.round(dbl(copyDetails.get("copies")));
+            double copyTotal = dbl(copyDetails.get("totalPrice"));
+            if (pages < 1 || copies < 1 || copyTotal < 0 || pages > 100000 || copies > 100000 || copyTotal != Math.rint(copyTotal)) throw err(400,"Completá páginas, cantidad de juegos y precio total en números enteros válidos.");
+            String format = str(copyDetails.get("format")), color = str(copyDetails.get("color"));
+            if (format.isBlank() || color.isBlank()) throw err(400,"Elegí el tamaño de papel y el tipo de impresión.");
+            long qty = pages * copies;
+            Map<String,Object> it = new LinkedHashMap<>();
+            it.put("productId", null); it.put("title", "Fotocopias · "+format+" · "+color); it.put("qty", qty); it.put("price", qty == 0 ? 0 : copyTotal / qty); it.put("cost", 0); it.put("ivaRate", 0); it.put("subtotal", copyTotal); lines.add(it);
+            total += copyTotal;
+        }
         Map<String, Object> sh = openShift(u);
         if (sh == null && !isBoss(u)) throw err(400, "Fichá tu entrada antes de vender.");
 
-        long number = list(c, "sales").size() + 1;
+        int currentYear = LocalDate.now(ZoneId.of(tz)).getYear();
+        long number = list(c, "sales").stream().filter(x -> {
+            try { return dayOf(x.get("at")).getYear() == currentYear; }
+            catch (Exception ignored) { return false; }
+        }).count() + 1;
         String ref = "Venta #" + pad(number);
         List<Map<String, Object>> items = new ArrayList<>();
-        double total = 0;
+        if (photocopy) {
+            for (Map<String,Object> line : lines) if (line.get("productId") == null) items.add(line);
+        }
         for (Map<String, Object> l : lines) {
+            if (l.get("productId") == null) continue;
             long q = Math.round(dbl(l.get("qty")));
             if (q < 1) throw err(400, "Cantidad inválida.");
             Rec pr = find(c, "products", l.get("productId"));
@@ -748,7 +998,7 @@ public class Api {
             double price = dbl(p.get("sellPrice"));
             total += price * q;
             Map<String, Object> it = new LinkedHashMap<>();
-            it.put("productId", pr.id); it.put("title", str(p.get("title"))); it.put("qty", q); it.put("price", price); it.put("cost", dbl(p.get("buyPrice")));
+            it.put("productId", pr.id); it.put("title", str(p.get("title"))); it.put("qty", q); it.put("price", price); it.put("subtotal", price * q); it.put("cost", dbl(p.get("buyPrice"))); it.put("ivaRate", dbl(p.get("ivaRate")));
             items.add(it);
             move(u, pr.id, str(p.get("title")), "venta", q, have, have - q, ref);
         }
@@ -784,12 +1034,15 @@ public class Api {
         sale.put("shiftName", sh == null ? null : sh.get("shiftName"));
         sale.put("clientId", cr == null ? null : cr.id); sale.put("clientName", clientName); sale.put("clientEmail", clientEmail);
         sale.put("payment", pay); sale.put("items", items); sale.put("total", total);
+        sale.put("saleType", photocopy ? (items.stream().anyMatch(it -> it.get("productId") != null) ? "MIXTA" : "FOTOCOPIAS") : "PRODUCTOS");
+        if (photocopy) sale.put("photocopy", copyDetails);
         Map<String, Object> out = rd(mk(c, "sales", sale));
         log(u, "Registró la venta #" + pad(number) + " por $" + Math.round(total) + " (" + pay + ") a " + clientName);
 
         // factura por email (PDF adjunto + detalle en el cuerpo), con la misma configuración de Gmail
         String company = cos.findById(c).map(x -> x.name).orElse("");
-        boolean canMail = clientEmail.matches(EMAIL); // consumidor final o cliente sin correo: no se envía factura
+        boolean demoCompany = cos.findById(c).map(co -> Boolean.TRUE.equals(co.demo)).orElse(false);
+        boolean canMail = !demoCompany && clientEmail.matches(EMAIL); // demo y consumidor final no generan envíos reales
         if (canMail) try {
             byte[] pdf = TicketPdf.pdf(company, out, tz);
             mailer.send(clientEmail, "Tu factura de " + company + " - Ticket N° " + pad(number), TicketPdf.text(company, out, tz),
@@ -798,7 +1051,7 @@ public class Api {
             LOG.warn("No se pudo generar la factura: {}", e.getMessage());
         }
         out.put("emailTo", clientEmail);
-        out.put("emailStatus", !canMail ? "sin_email" : mailer.configured() ? "enviando" : "sin_configurar");
+        out.put("emailStatus", demoCompany ? "demostracion" : !canMail ? "sin_email" : mailer.configured() ? "enviando" : "sin_configurar");
         if (!isBoss(u)) ((List<Map<String, Object>>) out.get("items")).forEach(i -> i.remove("cost"));
         return out;
     }
@@ -826,7 +1079,7 @@ public class Api {
     @SuppressWarnings("unchecked")
     @PostMapping("/purchases")
     public Map<String, Object> newPurchase(@RequestBody Map<String, Object> b, HttpSession s) {
-        AppUser u = boss(s);
+        AppUser u = me(s);
         Long c = u.companyId;
         lockCompany(c);
         List<Map<String, Object>> existing = list(c, "purchases");
@@ -840,6 +1093,20 @@ public class Api {
         catch (DateTimeParseException e) { throw err(400, "La fecha de la compra no es válida."); }
         if (day.isAfter(today)) throw err(400, "La fecha de la compra no puede ser futura.");
         String invoice = cut(str(b.get("invoice")), 60), notes = cut(str(b.get("notes")), 500);
+        String paymentMethod = str(b.get("paymentMethod")).toLowerCase(Locale.ROOT);
+        if (paymentMethod.isEmpty()) paymentMethod = "pendiente"; // compras históricas / clientes anteriores
+        if (!Set.of("efectivo", "pendiente").contains(paymentMethod))
+            throw err(400, "Elegí efectivo o cuenta corriente.");
+        String paymentStatus = paymentMethod.equals("pendiente") ? "PENDIENTE" : "PAGADA";
+        Long cashShiftId = null;
+        if (paymentStatus.equals("PAGADA") && !str(b.get("cashShiftId")).isBlank()) {
+            long selectedShiftId;
+            try { selectedShiftId = num(b.get("cashShiftId")); } catch (Exception ex) { throw err(400, "La caja seleccionada no es válida."); }
+            list(c, "shifts").stream().filter(sh -> num(sh.get("id")) == selectedShiftId && sh.get("end") == null).findFirst()
+                    .orElseThrow(() -> err(400, "La caja elegida no existe o ya está cerrada."));
+            cashShiftId = selectedShiftId;
+            if (paymentMethod.equals("transferencia")) cashShiftId = null; // transferencias no alteran el efectivo físico
+        }
         if (!invoice.isEmpty())
             for (Map<String, Object> p : existing)
                 if (!"ANULADA".equals(p.get("status")) && invoice.equalsIgnoreCase(str(p.get("invoice"))) && num(p.get("supplierId")) == sup.id)
@@ -866,6 +1133,7 @@ public class Api {
             Map<String, Object> p = rd(pr);
             long have = num(p.get("stock"));
             p.put("stock", have + q);
+            p.put("buyPrice", unit.doubleValue()); // recordar el último costo unitario ingresado en una compra
             wr(pr, p);
             move(u, pr.id, str(p.get("title")), "entrada", q, have, have + q, ref);
             Map<String, Object> it = new LinkedHashMap<>();
@@ -877,10 +1145,45 @@ public class Api {
         pu.put("number", number); pu.put("date", day.toString()); pu.put("at", Instant.now().toString());
         pu.put("supplierId", sup.id); pu.put("supplierName", supplierName); pu.put("invoice", invoice); pu.put("notes", notes);
         pu.put("items", items); pu.put("total", total.doubleValue()); pu.put("status", "REGISTRADA"); pu.put("requestId", requestId);
+        pu.put("paymentMethod", paymentMethod); pu.put("paymentStatus", paymentStatus);
+        pu.put("paidAt", paymentStatus.equals("PAGADA") ? Instant.now().toString() : null);
+        if (cashShiftId != null && paymentMethod.equals("efectivo")) pu.put("cashShiftId", cashShiftId);
         pu.put("userId", u.id); pu.put("user", u.name);
         Map<String, Object> out = rd(mk(c, "purchases", pu));
-        log(u, "Registró la compra #" + pad(number) + " a " + supplierName + " por $" + Math.round(total.doubleValue()));
+        log(u, "Registró la compra #" + pad(number) + " a " + supplierName + " por $" + Math.round(total.doubleValue()) + " · pago: " + (paymentMethod.equals("pendiente") ? "cuenta corriente" : paymentMethod));
         return out;
+    }
+
+    /** Registra el pago posterior de una compra que quedó en cuenta corriente. El pago se contabiliza el día en que realmente se realiza. */
+    @PostMapping("/purchases/{id}/pay")
+    public Map<String, Object> payPurchase(@PathVariable Long id, @RequestBody Map<String, Object> b, HttpSession s) {
+        AppUser u = me(s);
+        Long c = u.companyId;
+        lockCompany(c);
+        Rec rec = find(c, "purchases", id);
+        Map<String,Object> purchase = rd(rec);
+        if ("ANULADA".equals(str(purchase.get("status")))) throw err(409, "No se puede pagar una compra anulada.");
+        if ("PAGADA".equals(str(purchase.get("paymentStatus")))) throw err(409, "Esta compra ya figura como pagada.");
+        String method = str(b.get("paymentMethod")).toLowerCase(Locale.ROOT);
+        if (!Set.of("efectivo", "transferencia").contains(method)) throw err(400, "Elegí efectivo o transferencia.");
+        Long cashShiftId = null;
+        if (method.equals("efectivo") && !str(b.get("cashShiftId")).isBlank()) {
+            long selectedShiftId;
+            try { selectedShiftId = num(b.get("cashShiftId")); } catch (Exception ex) { throw err(400, "La caja seleccionada no es válida."); }
+            list(c, "shifts").stream().filter(sh -> num(sh.get("id")) == selectedShiftId && sh.get("end") == null).findFirst()
+                    .orElseThrow(() -> err(400, "La caja elegida no existe o ya está cerrada."));
+            cashShiftId = selectedShiftId;
+        }
+        purchase.put("paymentMethod", method);
+        purchase.put("paymentStatus", "PAGADA");
+        purchase.put("paidAt", Instant.now().toString());
+        purchase.put("paidByUserId", u.id);
+        purchase.put("paidBy", u.name);
+        purchase.remove("cashShiftId");
+        if (cashShiftId != null && method.equals("efectivo")) purchase.put("cashShiftId", cashShiftId);
+        wr(rec, purchase);
+        log(u, "Registró el pago de la compra #" + pad(num(purchase.get("number"))) + " por $" + Math.round(dbl(purchase.get("total"))) + " mediante " + method);
+        return purchase;
     }
 
     /**
@@ -932,17 +1235,32 @@ public class Api {
         if (openShift(u) != null) throw err(400, "Ya fichaste tu entrada.");
         long counter = Math.round(dbl(b.get("counter")));
         if (counter < 1) throw err(400, "Indicá en qué mostrador estás.");
+        Map<String,Object> cfg = list(u.companyId, "companyconfig").stream().findFirst().orElse(Map.of("counters",1,"cashBalances",List.of(0)));
+        int maxCounters = (int)Math.max(1, Math.min(50, Math.round(dbl(cfg.get("counters")))));
+        if (counter > maxCounters) throw err(400, "Esta empresa tiene configurados " + maxCounters + " mostrador(es).");
+        boolean counterBusy = list(u.companyId, "shifts").stream().anyMatch(x -> dbl(x.get("counter")) == counter && x.get("end") == null && !Boolean.TRUE.equals(x.get("bossNoCounter")));
+        if (counterBusy) throw err(400, "El mostrador " + counter + " ya tiene un turno abierto. Elegí otro mostrador o esperá a que se cierre.");
+        List<Map<String,Object>> previous = list(u.companyId, "shifts").stream().filter(x -> dbl(x.get("counter")) == counter && x.get("end") != null && !Boolean.TRUE.equals(x.get("bossNoCounter")))
+                .sorted((a,b2) -> str(b2.get("end")).compareTo(str(a.get("end")))).collect(Collectors.toList());
+        double expectedOpeningCash = 0;
+        if (!previous.isEmpty() && previous.get(0).get("finalCash") != null) expectedOpeningCash = dbl(previous.get(0).get("finalCash"));
+        else if (cfg.get("cashBalances") instanceof List<?> cb && counter <= cb.size()) expectedOpeningCash = dbl(cb.get((int)counter - 1));
+        if (!b.containsKey("openingCash") || !str(b.get("openingCash")).matches("\\d{1,12}")) throw err(400, "Al iniciar el turno, ingresá el saldo inicial en efectivo usando solo números enteros.");
+        double openingCash = dbl(b.get("openingCash"));
+        if (openingCash < 0 || openingCash > 1000000000000d) throw err(400, "El saldo inicial no es válido.");
+        double openingDifference = openingCash - expectedOpeningCash;
         Map<String, Object> def = null;
         if (!activeDefs(u.companyId).isEmpty()) { // si el jefe configuró turnos, el empleado tiene que elegir uno
             if (str(b.get("shiftDefId")).isEmpty()) throw err(400, "Elegí tu turno.");
             def = pickDef(u.companyId, b.get("shiftDefId"));
         }
         Map<String, Object> rec = new LinkedHashMap<>();
-        rec.put("userId", u.id); rec.put("user", u.name); rec.put("start", Instant.now().toString()); rec.put("counter", counter);
+        rec.put("userId", u.id); rec.put("user", u.name); rec.put("username", u.username); rec.put("start", Instant.now().toString()); rec.put("counter", counter); rec.put("openingCash", openingCash); rec.put("expectedOpeningCash", expectedOpeningCash); rec.put("openingDifference", openingDifference);
         if (def != null) stampDef(rec, def);
         mk(u.companyId, "shifts", rec);
-        log(u, "Fichó la entrada en el mostrador " + counter + (def != null ? " (turno " + def.get("name") + ")" : ""));
-        return ok();
+        log(u, "Fichó la entrada en el mostrador " + counter + (def != null ? " (turno " + def.get("name") + ")" : "") + "; saldo contado $" + Math.round(openingCash));
+        if (Math.abs(openingDifference) > 0.001) log(u, "ALERTA DE CAJA: el saldo inicial del mostrador " + counter + " no coincide con el cierre anterior. Esperado $" + Math.round(expectedOpeningCash) + ", contado $" + Math.round(openingCash) + ", diferencia $" + Math.round(openingDifference));
+        return Map.of("ok", true, "openingCash", openingCash, "expectedOpeningCash", expectedOpeningCash, "openingDifference", openingDifference);
     }
 
     @PostMapping("/shift/counter")
@@ -952,35 +1270,117 @@ public class Api {
         if (sh == null) throw err(400, "No tenés un turno abierto.");
         long counter = Math.round(dbl(b.get("counter")));
         if (counter < 1) throw err(400, "Indicá un número de mostrador válido.");
-        Rec r = find(u.companyId, "shifts", sh.get("id"));
-        sh.put("counter", counter);
-        if (!str(b.get("shiftDefId")).isEmpty()) stampDef(sh, pickDef(u.companyId, b.get("shiftDefId")));
-        wr(r, sh);
-        log(u, "Cambió al mostrador " + counter + (sh.get("shiftName") != null ? " (turno " + sh.get("shiftName") + ")" : ""));
+        if (counter != Math.round(dbl(sh.get("counter")))) {
+            throw err(403, "No podés cambiar de mostrador después de fichar la entrada. Cerrá la caja para liberar el mostrador.");
+        }
         return ok();
     }
 
-    /** Fichar salida: cierra el turno y registra el faltante o sobrante que declara el empleado. */
+    /** Cierre con arqueo físico y conciliación automática de cada medio de pago. */
     @PostMapping("/shift/end")
     public Map<String, Object> shiftEnd(@RequestBody Map<String, Object> b, HttpSession s) {
         AppUser u = me(s);
         Map<String, Object> sh = openShift(u);
         if (sh == null) throw err(400, "No tenés un turno abierto.");
-        double amt = Math.max(0, dbl(b.get("diffAmount")));
-        String t = str(b.get("diffType"));
-        double diff = t.equals("sobrante") ? amt : t.equals("faltante") ? -amt : 0;
+        double finalCash = integerAmount(b, "finalCash", "Ingresá el saldo final en efectivo usando solo números enteros.");
+        double declaredCard = integerAmount(b, "cardCollected", "Ingresá el total cobrado con tarjeta usando solo números enteros.");
+        double declaredQr = integerAmount(b, "qrCollected", "Ingresá el total cobrado con QR usando solo números enteros.");
+        double declaredTransfer = integerAmount(b, "transferCollected", "Ingresá el total cobrado por transferencia usando solo números enteros.");
+        long shiftId = num(sh.get("id"));
+        double cashSales=0, cardSales=0, qrSales=0, transferSales=0, cashPurchases=0, withdrawalsTotal=0;
+        for (Map<String,Object> sale : list(u.companyId, "sales")) {
+            if (sale.get("shiftId") == null || num(sale.get("shiftId")) != shiftId) continue;
+            double t = dbl(sale.get("total")); String p = str(sale.get("payment"));
+            if (p.equals("efectivo")) cashSales += t; else if (p.equals("tarjeta")) cardSales += t; else if (p.equals("qr")) qrSales += t; else if (p.equals("transferencia")) transferSales += t;
+        }
+        for (Map<String,Object> purchase : list(u.companyId, "purchases")) if ("PAGADA".equals(str(purchase.get("paymentStatus"))) && purchase.get("cashShiftId") != null && num(purchase.get("cashShiftId")) == shiftId && "efectivo".equals(str(purchase.get("paymentMethod")))) cashPurchases += dbl(purchase.get("total"));
+        for (Map<String,Object> withdrawal : list(u.companyId, "withdrawals")) if (withdrawal.get("shiftId") != null && num(withdrawal.get("shiftId")) == shiftId) withdrawalsTotal += dbl(withdrawal.get("amount"));
+        double expectedCash = dbl(sh.get("openingCash")) + cashSales - cashPurchases - withdrawalsTotal;
+        double diffCash = finalCash - expectedCash, diffCard = declaredCard - cardSales, diffQr = declaredQr - qrSales, diffTransfer = declaredTransfer - transferSales;
+        double diffTotal = Math.abs(diffCash) + Math.abs(diffCard) + Math.abs(diffQr) + Math.abs(diffTransfer);
         Rec r = find(u.companyId, "shifts", sh.get("id"));
-        sh.put("end", Instant.now().toString());
-        sh.put("diff", diff);
-        sh.put("diffNote", str(b.get("note")));
+        sh.put("end", Instant.now().toString()); sh.put("finalCash", finalCash); sh.put("expectedFinalCash", expectedCash);
+        sh.put("cashPurchases", cashPurchases); sh.put("cashWithdrawals", withdrawalsTotal);
+        sh.put("cashSales", cashSales); sh.put("totalSold", cashSales + cardSales + qrSales + transferSales);
+        sh.put("salesCount", list(u.companyId, "sales").stream().filter(sale -> sale.get("shiftId") != null && num(sale.get("shiftId")) == shiftId).count());
+        sh.put("expectedCard", cardSales); sh.put("expectedQr", qrSales); sh.put("expectedTransfer", transferSales);
+        sh.put("declaredCard", declaredCard); sh.put("declaredQr", declaredQr); sh.put("declaredTransfer", declaredTransfer);
+        sh.put("diffCash", diffCash); sh.put("diffCard", diffCard); sh.put("diffQr", diffQr); sh.put("diffTransfer", diffTransfer); sh.put("diffTotal", diffTotal); sh.put("diff", diffCash);
+        sh.put("cashReconciled", Math.abs(diffTotal) < 0.001 && Math.abs(dbl(sh.get("openingDifference"))) < 0.001);
         wr(r, sh);
-        log(u, "Fichó la salida (" + (diff == 0 ? "sin diferencia de caja" : (diff > 0 ? "sobrante $" : "faltante $") + Math.round(Math.abs(diff))) + ")");
-        return ok();
+        String summary = "Cerró caja. Diferencias: efectivo $"+Math.round(diffCash)+", tarjeta $"+Math.round(diffCard)+", QR $"+Math.round(diffQr)+", transferencia $"+Math.round(diffTransfer);
+        log(u, summary);
+        if (diffTotal > 0.001 || Math.abs(dbl(sh.get("openingDifference"))) > 0.001) log(u, "ALERTA DE CIERRE DE CAJA: revisar el turno de "+u.name+" en mostrador "+sh.get("counter")+". Diferencia total absoluta $"+Math.round(diffTotal));
+        return sh;
+    }
+
+    private double integerAmount(Map<String,Object> b, String key, String message) {
+        Object raw = b.get(key); String value = raw == null ? "" : String.valueOf(raw);
+        if (!value.matches("\\d{1,12}")) throw err(400, message);
+        double n = dbl(raw); if (n < 0 || n > 1000000000000d) throw err(400, message); return n;
     }
 
     static String dif(double x) { return x == 0 ? "sin diferencia" : (x > 0 ? "sobrante $" : "faltante $") + Math.round(Math.abs(x)); }
 
-    /** Corrección de un cierre de caja ya hecho. Solo el jefe (o el administrador global): boss() lo exige en el servidor. */
+    /** Retiro explícito de efectivo de un mostrador; no ficha salida ni cierra el turno. */
+    @PostMapping("/shift/withdrawals")
+    public Map<String,Object> withdrawCash(@RequestBody Map<String,Object> b, HttpSession s) {
+        AppUser u = me(s);
+        double amount = dbl(b.get("amount")); String reason = str(b.get("reason"));
+        if (!(amount > 0) || amount > 1000000000d || amount != Math.rint(amount)) throw err(400, "Ingresá un importe de retiro entero usando solo números.");
+        if (reason.isBlank()) throw err(400, "Indicá el motivo del retiro.");
+        Map<String,Object> sh;
+        if (isBoss(u) && !str(b.get("shiftId")).isBlank()) {
+            sh = list(u.companyId,"shifts").stream().filter(x -> num(x.get("id")) == num(b.get("shiftId")) && x.get("end") == null).findFirst().orElseThrow(() -> err(400,"Elegí un mostrador con turno abierto."));
+        } else sh = openShift(u);
+        if (sh == null) throw err(400, "Necesitás tener un turno abierto para retirar efectivo.");
+        double available = dbl(sh.get("openingCash"));
+        for (Map<String,Object> sale : list(u.companyId,"sales")) if (sale.get("shiftId") != null && num(sale.get("shiftId")) == num(sh.get("id")) && "efectivo".equals(str(sale.get("payment")))) available += dbl(sale.get("total"));
+        for (Map<String,Object> purchase : list(u.companyId,"purchases")) if ("PAGADA".equals(str(purchase.get("paymentStatus"))) && purchase.get("cashShiftId") != null && num(purchase.get("cashShiftId")) == num(sh.get("id")) && "efectivo".equals(str(purchase.get("paymentMethod")))) available -= dbl(purchase.get("total"));
+        for (Map<String,Object> old : list(u.companyId,"withdrawals")) if (old.get("shiftId") != null && num(old.get("shiftId")) == num(sh.get("id"))) available -= dbl(old.get("amount"));
+        if (amount > available) throw err(400, "El retiro supera el efectivo esperado disponible en ese mostrador (" + Math.round(Math.max(0,available)) + ").");
+        Map<String,Object> rec = new LinkedHashMap<>(); rec.put("at",Instant.now().toString()); rec.put("userId",u.id); rec.put("user",u.name); rec.put("shiftId",sh.get("id")); rec.put("counter",sh.get("counter")); rec.put("amount",amount); rec.put("reason",reason);
+        mk(u.companyId,"withdrawals",rec);
+        log(u,"Retiró $"+Math.round(amount)+" de caja del mostrador "+sh.get("counter")+": "+reason);
+        return rec;
+    }
+
+    /** El jefe puede corregir un cierre completo; las diferencias se recalculan contra las ventas y egresos registrados. */
+    @PutMapping("/shift/{id}/edit")
+    public Map<String, Object> editClosedShift(@PathVariable Long id, @RequestBody Map<String, Object> b, HttpSession s) {
+        AppUser u = boss(s);
+        Rec r = find(u.companyId, "shifts", id);
+        Map<String,Object> sh = rd(r);
+        if (sh.get("end") == null) throw err(400, "Solo se pueden editar turnos ya cerrados.");
+        double finalCash = integerAmount(b, "finalCash", "Ingresá el efectivo contado usando solo números enteros.");
+        double declaredCard = integerAmount(b, "cardCollected", "Ingresá la tarjeta usando solo números enteros.");
+        double declaredQr = integerAmount(b, "qrCollected", "Ingresá el QR usando solo números enteros.");
+        double declaredTransfer = integerAmount(b, "transferCollected", "Ingresá las transferencias usando solo números enteros.");
+        long shiftId = num(sh.get("id"));
+        double cashSales=0, cardSales=0, qrSales=0, transferSales=0, cashPurchases=0, withdrawalsTotal=0;
+        for (Map<String,Object> sale : list(u.companyId, "sales")) {
+            if (sale.get("shiftId") == null || num(sale.get("shiftId")) != shiftId) continue;
+            double total=dbl(sale.get("total"));
+            switch (str(sale.get("payment"))) { case "efectivo" -> cashSales+=total; case "tarjeta" -> cardSales+=total; case "qr" -> qrSales+=total; case "transferencia" -> transferSales+=total; default -> { } }
+        }
+        for (Map<String,Object> purchase : list(u.companyId, "purchases")) if ("PAGADA".equals(str(purchase.get("paymentStatus"))) && purchase.get("cashShiftId") != null && num(purchase.get("cashShiftId")) == shiftId && "efectivo".equals(str(purchase.get("paymentMethod")))) cashPurchases += dbl(purchase.get("total"));
+        for (Map<String,Object> withdrawal : list(u.companyId, "withdrawals")) if (withdrawal.get("shiftId") != null && num(withdrawal.get("shiftId")) == shiftId) withdrawalsTotal += dbl(withdrawal.get("amount"));
+        double expectedCash=dbl(sh.get("openingCash"))+cashSales-cashPurchases-withdrawalsTotal;
+        double diffCash=finalCash-expectedCash, diffCard=declaredCard-cardSales, diffQr=declaredQr-qrSales, diffTransfer=declaredTransfer-transferSales;
+        double diffTotal=Math.abs(diffCash)+Math.abs(diffCard)+Math.abs(diffQr)+Math.abs(diffTransfer);
+        sh.putIfAbsent("originalCloseValues", Map.of("finalCash", dbl(sh.get("finalCash")), "declaredCard", dbl(sh.get("declaredCard")), "declaredQr", dbl(sh.get("declaredQr")), "declaredTransfer", dbl(sh.get("declaredTransfer"))));
+        sh.put("finalCash",finalCash); sh.put("expectedFinalCash",expectedCash); sh.put("expectedCard",cardSales); sh.put("expectedQr",qrSales); sh.put("expectedTransfer",transferSales);
+        sh.put("declaredCard",declaredCard); sh.put("declaredQr",declaredQr); sh.put("declaredTransfer",declaredTransfer);
+        sh.put("cashPurchases",cashPurchases); sh.put("cashWithdrawals",withdrawalsTotal); sh.put("cashSales",cashSales); sh.put("totalSold",cashSales+cardSales+qrSales+transferSales);
+        sh.put("diffCash",diffCash); sh.put("diffCard",diffCard); sh.put("diffQr",diffQr); sh.put("diffTransfer",diffTransfer); sh.put("diffTotal",diffTotal); sh.put("diff",diffCash);
+        sh.put("cashReconciled",Math.abs(diffTotal)<0.001 && Math.abs(dbl(sh.get("openingDifference")))<0.001);
+        sh.put("editedBy",u.name); sh.put("editedAt",Instant.now().toString()); sh.put("editNote",str(b.get("note")));
+        wr(r,sh);
+        log(u,"Corrigió el cierre de caja de "+str(sh.get("user"))+". Diferencia recalculada: $"+Math.round(diffTotal)+". Nota: "+str(b.get("note")));
+        return sh;
+    }
+
+    /** Corrección de una diferencia anotada en un cierre ya hecho. Solo el jefe. */
     @PutMapping("/shift/{id}/diff")
     public Map<String, Object> editShiftDiff(@PathVariable Long id, @RequestBody Map<String, Object> b, HttpSession s) {
         AppUser u = boss(s);
@@ -997,6 +1397,7 @@ public class Api {
         sh.put("diffNote", str(b.get("note")));
         sh.put("editedBy", u.name);
         sh.put("editedAt", Instant.now().toString());
+        if (sh.get("finalCash") != null) sh.put("finalCash", dbl(sh.get("finalCash")) + diff - before);
         wr(r, sh);
         log(u, "Corrigió el cierre de caja de " + sh.get("user") + ": de " + dif(before) + " a " + dif(diff));
         return ok();
@@ -1165,6 +1566,7 @@ public class Api {
     @PostMapping("/subscription/checkout")
     public Map<String, Object> checkout(@RequestBody(required = false) Map<String, Object> b, HttpSession s) {
         AppUser u = real(s);
+        if (!isGlobal(u) && u.companyId != null && cos.findById(u.companyId).map(c -> Boolean.TRUE.equals(c.demo)).orElse(false)) throw err(403, "La demostración no permite pagos ni suscripciones reales.");
         if (isGlobal(u) || !isBoss(u)) throw err(403, "Solo el jefe de la empresa puede suscribirse.");
         if (!mp.configured()) throw err(503, "El pago online todavía no está disponible. Contactá a soporte.");
         Company c = cos.findWithLockById(u.companyId).orElseThrow(() -> err(401, "Iniciá sesión."));
@@ -1204,6 +1606,7 @@ public class Api {
     @PostMapping("/subscription/cancel")
     public Map<String, Object> cancelSubscription(@RequestBody(required = false) Map<String, Object> b, HttpSession s) {
         AppUser u = real(s);
+        if (!isGlobal(u) && u.companyId != null && cos.findById(u.companyId).map(c -> Boolean.TRUE.equals(c.demo)).orElse(false)) throw err(403, "La demostración no permite pagos ni suscripciones reales.");
         if (isGlobal(u) || !isBoss(u)) throw err(403, "Solo el jefe de la empresa puede dar de baja la suscripción.");
         if (b == null || !Boolean.TRUE.equals(b.get("confirm"))) throw err(400, "Falta la confirmación de la baja.");
         Company c = cos.findWithLockById(u.companyId).orElseThrow(() -> err(401, "Iniciá sesión."));
@@ -1420,6 +1823,7 @@ public class Api {
     public Map<String, Object> adminSub(@PathVariable Long id, @RequestBody Map<String, Object> b, HttpSession s) {
         AppUser g = global(s);
         Company c = cos.findWithLockById(id).orElseThrow(() -> err(404, "La empresa no existe."));
+        if (Boolean.TRUE.equals(c.demo)) throw err(400, "La suscripción de demostración no se modifica.");
         String action = str(b.get("action"));
         Instant now = Instant.now();
         if (action.equals("activate")) {

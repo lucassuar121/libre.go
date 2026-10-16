@@ -14,6 +14,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /** Flujo HTTP real contra la aplicación: bloqueo por suscripción, permisos y administrador global. */
@@ -96,7 +97,7 @@ class SubscriptionHttpTest {
     }
 
     @Test
-    void elEmpleadoNoVeMovimientosNiComprasYLasTareasExigenToken() throws Exception {
+    void elEmpleadoPuedeRegistrarComprasPeroNoEditarProductosYLasTareasExigenToken() throws Exception {
         MockHttpSession jefe = new MockHttpSession(), empleado = new MockHttpSession(), admin = new MockHttpSession();
         AppUser jefeUser = crearCuentaDePrueba(jefe, "Compras SA", "Jefe Dos", "jefecompras", "compras@test.com");
         Long cid = jefeUser.companyId;
@@ -116,13 +117,26 @@ class SubscriptionHttpTest {
         llamar(jefe, "/api/purchases", "{\"requestId\":\"http-1\",\"supplierId\":" + supplier + ",\"invoice\":\"F-1\",\"items\":[{\"productId\":" + product + ",\"qty\":10,\"unitPrice\":250.5}]}", 200);
         assertTrue(leer(jefe, "/api/bootstrap").contains("\"stock\":15")); // el reintento no vuelve a sumar
 
-        // el empleado: ve el stock actual, pero no recibe movimientos ni compras, y no puede usar esas rutas
+        // El empleado puede registrar compras y movimientos, pero no editar productos ni consultar el historial global de stock.
         llamar(empleado, "/api/auth/login", "{\"username\":\"anacompras\",\"password\":\"clave12345\"}", 200);
         String bootE = leer(empleado, "/api/bootstrap");
         assertTrue(bootE.contains("\"moves\":[]"));
-        assertTrue(bootE.contains("\"purchases\":[]"));
+        assertTrue(bootE.contains("\"purchases\":[{"));
         assertTrue(bootE.contains("\"stock\":15"));
-        llamar(empleado, "/api/purchases", "{\"supplierId\":" + supplier + ",\"items\":[]}", 403);
+        assertTrue(bootE.contains("\"buyPrice\":250.5")); // la compra recuerda el último costo unitario
+        mvc.perform(put("/api/products/" + product).contentType(MediaType.APPLICATION_JSON)
+                .content("{\"title\":\"Cambio no permitido\"}").session(empleado)).andExpect(status().is(403));
+        llamar(empleado, "/api/stock/new", "{\"title\":\"Producto cargado por empleado\",\"type\":\"papeleria\",\"sellPrice\":150,\"buyPrice\":90,\"units\":1}", 200);
+        String bootConProductoNuevo = leer(empleado, "/api/bootstrap");
+        assertTrue(bootConProductoNuevo.contains("Producto cargado por empleado"));
+        Long productoEmpleado = recs.findByCompanyIdAndKind(cid, "products").stream()
+                .filter(r -> r.payload != null && r.payload.contains("\"title\":\"Producto cargado por empleado\""))
+                .findFirst().orElseThrow().id;
+        mvc.perform(put("/api/products/" + productoEmpleado).contentType(MediaType.APPLICATION_JSON)
+                .content("{\"title\":\"Edición no permitida\"}").session(empleado)).andExpect(status().is(403));
+        llamar(empleado, "/api/purchases", "{\"requestId\":\"employee-purchase\",\"supplierId\":" + supplier + ",\"invoice\":\"F-2\",\"items\":[{\"productId\":" + product + ",\"qty\":1,\"unitPrice\":250.5}]}", 200);
+        assertTrue(leer(empleado, "/api/bootstrap").contains("\"stock\":16"));
+        mvc.perform(get("/api/fiscal/invoices").session(empleado)).andExpect(status().isOk());
         llamar(empleado, "/api/purchases/1/cancel", "{\"reason\":\"x\"}", 403);
 
         // tareas automáticas: sin token (o con token incorrecto) se rechazan

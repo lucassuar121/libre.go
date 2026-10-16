@@ -24,7 +24,7 @@ import java.util.Map;
 final class TicketPdf {
     private TicketPdf() {}
 
-    static final Map<String, String> PAY = Map.of("efectivo", "Efectivo", "tarjeta", "Tarjeta", "qr", "QR");
+    static final Map<String, String> PAY = Map.of("efectivo", "Efectivo", "tarjeta", "Tarjeta", "qr", "QR", "transferencia", "Transferencia");
 
     static String money(double v) { return String.format(Locale.of("es", "AR"), "$ %,.0f", v); }
     static String when(Object at, String tz) {
@@ -97,8 +97,8 @@ final class TicketPdf {
         sb.append(company).append("\nFactura / Ticket N° ").append(number(s)).append("\n\n");
         sb.append("Cliente: ").append(s.get("clientName")).append("\nFecha y hora: ").append(when(s.get("at"), tz)).append("\n\n");
         for (Map<String, Object> i : items(s)) {
-            double price = d(i.get("price")), qty = d(i.get("qty"));
-            sb.append((long) qty).append(" x ").append(i.get("title")).append(" a ").append(money(price)).append(" = ").append(money(price * qty)).append("\n");
+            double price = d(i.get("price")), qty = d(i.get("qty")), subtotal = i.get("subtotal") instanceof Number ? d(i.get("subtotal")) : price * qty;
+            sb.append((long) qty).append(" x ").append(i.get("title")).append(" a ").append(money(price)).append(" = ").append(money(subtotal)).append("\n");
         }
         sb.append("\nTOTAL: ").append(money(d(s.get("total")))).append("\nMedio de pago: ").append(pay(s)).append("\n\nGracias por su compra.");
         return sb.toString();
@@ -107,11 +107,11 @@ final class TicketPdf {
     static String html(String company, Map<String, Object> s, String tz) {
         StringBuilder rows = new StringBuilder();
         for (Map<String, Object> i : items(s)) {
-            double price = d(i.get("price")), qty = d(i.get("qty"));
+            double price = d(i.get("price")), qty = d(i.get("qty")), subtotal = i.get("subtotal") instanceof Number ? d(i.get("subtotal")) : price * qty;
             rows.append("<tr><td style='padding:6px;border-bottom:1px solid #ddd'>").append(esc(i.get("title")))
                 .append("</td><td style='padding:6px;border-bottom:1px solid #ddd;text-align:center'>").append((long) qty)
                 .append("</td><td style='padding:6px;border-bottom:1px solid #ddd;text-align:right'>").append(money(price))
-                .append("</td><td style='padding:6px;border-bottom:1px solid #ddd;text-align:right'>").append(money(price * qty)).append("</td></tr>");
+                .append("</td><td style='padding:6px;border-bottom:1px solid #ddd;text-align:right'>").append(money(subtotal)).append("</td></tr>");
         }
         return "<div style='font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#1b2a2a'>"
             + "<h2 style='margin-bottom:0'>" + esc(company) + "</h2>"

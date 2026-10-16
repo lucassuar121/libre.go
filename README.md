@@ -172,6 +172,8 @@ La base H2 sigue disponible para desarrollo (no se eliminó).
 | `JOBS_TOKEN` | Recomendada en Cloud Run | Cloud Scheduler ejecuta las tareas automáticas (bajas y vencimientos) |
 | `SUBSCRIPTION_DELETE_GRACE_DAYS` | No | Días de gracia antes de eliminar empresas dadas de baja |
 | `MERCADOPAGO_PUBLIC_KEY`, `MERCADOPAGO_SANDBOX` | No | Reservada / modo prueba |
+| `ARCA_ENCRYPTION_KEY` | Al guardar certificados ARCA | Clave AES-256 en Base64 para cifrar certificados y contraseñas fiscales |
+| `ARCA_ALLOW_PRODUCTION=false` | Recomendado | Mantiene deshabilitada la emisión fiscal real hasta que se pruebe homologación |
 | `MAIL_USERNAME`, `MAIL_PASSWORD` | Para enviar emails | Gmail con contraseña de aplicación |
 | `PORT` | No | Cloud Run lo define solo (la app ya lo usa) |
 | `SUBSCRIPTION_PRICE`, `CONTACT_EMAIL`, `DB_POOL_SIZE`, `DDL_AUTO` | No | Precio (30000), aviso de contratos, conexiones, esquema |
@@ -206,3 +208,24 @@ reinicia o crea otra instancia, los usuarios tienen que volver a iniciar sesión
 4. **Probar el perfil de producción en tu PC:** además `SPRING_PROFILES_ACTIVE=prod`, `DB_USER`, `DB_PASSWORD`, `BASE_URL=https://ejemplo.com` y una
    `GLOBAL_ADMIN_PASSWORD` de 12+ caracteres. Sin alguna de ellas debe negarse a arrancar con un mensaje claro.
 5. **Imagen de Docker:** `docker build -t libre-go .` y `docker run -p 8080:8080 -e ... libre-go` (con las variables de producción).
+
+
+## Empresa de demostración privada
+
+- La empresa ficticia se abre desde el formulario habitual de **Iniciar sesión**; no hay botón público de demostración en la página de inicio.
+- Credenciales predeterminadas solo para desarrollo local: jefe `demo_jefe` / `DemoJefe2026!`; empleado `demo_empleado` / `DemoEmpleado2026!`. En producción hay que configurar `DEMO_BOSS_PASSWORD` y `DEMO_EMPLOYEE_PASSWORD` con claves propias y distintas; la aplicación no arranca en perfil `prod` si quedan las contraseñas predeterminadas. Compartí la cuenta de empleado únicamente con quienes quieras mostrarles el sistema.
+- Dentro de la cuenta se puede alternar entre jefe y empleado y restaurar los datos. Las ventas de distintos días están asignadas a turnos/cajas de su fecha. Los datos ficticios no se mezclan con empresas reales; no se pueden iniciar pagos, emitir facturas fiscales reales ni enviar correos reales desde la demo.
+- Restaurar la demo reconstruye solamente sus registros ficticios y restablece las contraseñas internas de ejemplo. Al desplegar una versión nueva, la migración de demo se aplica una sola vez mediante `demoVersion`.
+- Para usar el escáner de cámara, abrí LibreGo en `localhost` o mediante HTTPS y concedé permiso de cámara. También se admiten lectores USB/Bluetooth que escriben el código como teclado y envían Enter. Cada producto debe tener su ISBN/código de barras guardado en el campo correspondiente.
+
+## Facturación electrónica ARCA (integración inicial)
+- El jefe encuentra **Facturación ARCA** en el menú. La configuración es por empresa: CUIT, razón social, condición fiscal, punto de venta, ambiente y certificado PKCS#12 (.p12/.pfx). El certificado y su contraseña se cifran con AES-GCM antes de guardarse; nunca se devuelven al navegador.
+- En cada producto se puede configurar la alícuota de IVA. Desde Ventas, el jefe puede solicitar Factura A, B o C para una venta existente. La aplicación solicita el ticket de acceso a WSAA, consulta el último número de WSFEv1 y solicita el CAE. Solo guarda como autorizada una factura cuando ARCA devuelve un CAE; el PDF incluye CUIT, numeración, CAE, vencimiento y QR.
+- Antes de cargar el certificado, configurá una clave aleatoria de 32 bytes en Base64 como secreto `ARCA_ENCRYPTION_KEY`. En PowerShell podés generarla con:
+
+      [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+
+  Guardá el resultado en el gestor de secretos del hosting y mantenelo estable: si lo cambiás después de cifrar certificados, la app ya no podrá descifrarlos. Dejá `ARCA_ALLOW_PRODUCTION=false` al principio; solo después de probar y validar la integración en homologación se habilita la emisión real configurando `ARCA_ALLOW_PRODUCTION=true`.
+- En la configuración fiscal elegí **Homologación / pruebas** primero. El certificado debe corresponder al CUIT emisor y tener autorizado el servicio de facturación electrónica (WSFEv1); el punto de venta debe estar habilitado para web service. La aplicación no crea esas autorizaciones en nombre del contribuyente.
+- **Limitaciones de esta primera integración:** solo se implementan facturas A/B/C, una sola alícuota positiva por venta, y no se emiten ventas exentas/no gravadas al 0%, comprobantes M, notas de crédito/débito ni anulaciones fiscales. Si una venta contiene distintas alícuotas, se bloquea la emisión. No la uses para operaciones fiscales que no entren en esas reglas. La integración necesita una prueba real en homologación con credenciales y certificado válidos antes de pasar a producción; no se probó desde este entorno porque no hay conexión de red ni Maven disponible.
+- Los PDF no sustituyen la revisión contable/fiscal del comprobante. Confirmá la estructura y requisitos vigentes de ARCA con tu contador antes de emitir comprobantes de producción.

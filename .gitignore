@@ -3,5 +3,6 @@ data/
 *.log
 application-local.properties
 .env
+
 .idea/
 libre-go/

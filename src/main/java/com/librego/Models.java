@@ -15,6 +15,10 @@ public class Models {
     @Entity public static class Company {
         @Id @GeneratedValue public Long id;
         public String name;
+        /** Marca reservada para la empresa de demostración aislada. */
+        public Boolean demo = false;
+        /** Versión del conjunto de datos de demostración; permite actualizarlo una sola vez al desplegar una nueva versión. */
+        public Integer demoVersion = 0;
         /** Suscripción mensual: PENDIENTE_PAGO | ACTIVA | VENCIDA (null = empresa anterior a la suscripción, se migra al arrancar). */
         public String subStatus;
         public Instant subStart;
@@ -84,6 +88,54 @@ public class Models {
         Optional<SignupIntent> findByMpPaymentId(String mpPaymentId);
     }
 
+    /** Configuración fiscal cifrada y separada por empresa. */
+    @Entity public static class FiscalConfig {
+        @Id @GeneratedValue public Long id;
+        @Column(unique = true, nullable = false) public Long companyId;
+        public String cuit;
+        public String legalName;
+        public String ivaCondition;
+        public Integer pointOfSale;
+        public String environment; // HOMOLOGACION | PRODUCCION
+        @Column(length = 3000000) public String encryptedPkcs12;
+        @Column(length = 4000) public String encryptedCertificatePassword;
+        public Instant updatedAt;
+    }
+
+    /** Factura fiscal autorizada o rechazada por ARCA; nunca se simula el CAE. */
+    @Entity @Table(uniqueConstraints = @UniqueConstraint(name = "uk_fiscal_company_sale", columnNames = {"company_id", "sale_record_id"})) public static class FiscalInvoice {
+        @Id @GeneratedValue public Long id;
+        @Column(name = "company_id", nullable = false) public Long companyId;
+        @Column(name = "sale_record_id", nullable = false) public Long saleRecordId;
+        public String invoiceType;
+        public String issuerCuit;
+        public String issuerName;
+        public Integer pointOfSale;
+        public Long invoiceNumber;
+        public String issueDate;
+        public String buyerName;
+        public String buyerDocType;
+        public String buyerDocNumber;
+        public Double total;
+        public Double netAmount;
+        public Double vatAmount;
+        @Column(length = 100000) public String itemsJson;
+        public String cae;
+        public String caeExpiration;
+        public String status; // AUTHORIZED | REJECTED
+        public String environment;
+        @Column(length = 4000) public String responseSummary;
+        public Instant createdAt;
+    }
+
+    public interface FiscalConfigs extends JpaRepository<FiscalConfig, Long> {
+        Optional<FiscalConfig> findByCompanyId(Long companyId);
+    }
+    public interface FiscalInvoices extends JpaRepository<FiscalInvoice, Long> {
+        List<FiscalInvoice> findByCompanyIdOrderByIdDesc(Long companyId);
+        Optional<FiscalInvoice> findByCompanyIdAndSaleRecordId(Long companyId, Long saleRecordId);
+    }
+
     @Entity public static class AppUser {
         @Id @GeneratedValue public Long id;
         public Long companyId;
@@ -143,6 +195,7 @@ public class Models {
         List<Rec> findByCompanyIdAndKind(Long companyId, String kind);
         /** Últimos 300 registros de un tipo (para no leer toda la actividad cada vez). */
         List<Rec> findTop300ByCompanyIdAndKindOrderByIdDesc(Long companyId, String kind);
+        List<Rec> findByCompanyIdAndKindOrderByIdDesc(Long companyId, String kind);
         void deleteByCompanyId(Long companyId);
     }
 }
