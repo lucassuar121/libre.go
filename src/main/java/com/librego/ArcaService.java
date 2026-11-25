@@ -113,7 +113,16 @@ public class ArcaService {
         }
         int receiverVat = receiverVatCode(buyerIvaCondition);
         String request = "<ar:FECAESolicitar><ar:Auth>" + authXml(t, c) + "</ar:Auth><ar:FeCAEReq><ar:FeCabReq><ar:CantReg>1</ar:CantReg><ar:PtoVta>"+c.pointOfSale+"</ar:PtoVta><ar:CbteTipo>"+cbteType+"</ar:CbteTipo></ar:FeCabReq><ar:FeDetReq><ar:FECAEDetRequest><ar:Concepto>1</ar:Concepto><ar:DocTipo>"+docCode+"</ar:DocTipo><ar:DocNro>"+doc+"</ar:DocNro><ar:CbteDesde>"+next+"</ar:CbteDesde><ar:CbteHasta>"+next+"</ar:CbteHasta><ar:CbteFch>"+issueDate+"</ar:CbteFch><ar:ImpTotal>"+fmt(grossTotal)+"</ar:ImpTotal><ar:ImpTotConc>0</ar:ImpTotConc><ar:ImpNeto>"+fmt(net)+"</ar:ImpNeto><ar:ImpOpEx>0</ar:ImpOpEx><ar:ImpIVA>"+fmt(vat)+"</ar:ImpIVA><ar:ImpTrib>0</ar:ImpTrib><ar:MonId>PES</ar:MonId><ar:MonCotiz>1</ar:MonCotiz><ar:CondicionIVAReceptorId>"+receiverVat+"</ar:CondicionIVAReceptorId>"+ivaBlock+"</ar:FECAEDetRequest></ar:FeDetReq></ar:FeCAEReq></ar:FECAESolicitar>";
-        String response = soap(base, "FECAESolicitar", request);
+        String response;
+        try {
+            response = soap(base, "FECAESolicitar", request);
+        } catch (java.io.IOException lost) {
+            // La conexión se cortó sin respuesta: ARCA pudo haber autorizado igual. Se consulta ese número antes de rendirse,
+            // así no se pierde un CAE ya emitido ni se deja un hueco en la numeración.
+            Result recovered = recover(base, t, c, cbteType, next, type, grossTotal, net, vat, env);
+            if (recovered != null) return recovered;
+            throw lost;
+        }
         Document d = xml(response);
         String result = first(d, "Resultado");
         String cae = first(d, "CAE");
@@ -125,6 +134,19 @@ public class ArcaService {
         }
         String summary = "Resultado=" + result + "; CbteTipo=" + cbteType + "; PtoVta=" + c.pointOfSale;
         return new Result(next, cae, exp, type, c.pointOfSale, round(grossTotal), net, vat, env, summary);
+    }
+
+    /** Consulta si el comprobante {@code number} ya fue autorizado por ARCA con el mismo importe; devuelve null si no lo encuentra. */
+    private Result recover(String base, Ticket t, FiscalConfig c, int cbteType, long number, String type,
+                           double gross, double net, double vat, String env) {
+        try {
+            String body = "<ar:FECompConsultar><ar:Auth>"+authXml(t, c)+"</ar:Auth><ar:FeCompConsReq><ar:CbteTipo>"+cbteType+"</ar:CbteTipo><ar:CbteNro>"+number+"</ar:CbteNro><ar:PtoVta>"+c.pointOfSale+"</ar:PtoVta></ar:FeCompConsReq></ar:FECompConsultar>";
+            Document d = xml(soap(base, "FECompConsultar", body));
+            String cae = first(d, "CodAutorizacion"), exp = first(d, "FchVto"), total = first(d, "ImpTotal");
+            if (cae.isBlank() || !"A".equals(first(d, "Resultado"))) return null;
+            if (Math.abs(Double.parseDouble(total) - round(gross)) > 0.005) return null;
+            return new Result(number, cae, exp, type, c.pointOfSale, round(gross), net, vat, env, "Recuperado por consulta; CbteTipo=" + cbteType + "; PtoVta=" + c.pointOfSale);
+        } catch (Exception ignored) { return null; }
     }
 
     private long lastAuthorized(String base, Ticket t, FiscalConfig c, int cbteType) throws Exception {
@@ -171,7 +193,13 @@ public class ArcaService {
         Document ticket = xml(ret);
         String token = first(ticket, "token"), sign = first(ticket, "sign");
         if (token.isBlank() || sign.isBlank()) throw new IllegalStateException("ARCA no devolvió un ticket de acceso válido.");
-        Ticket out = new Ticket(token, sign, now.plusSeconds(540), env); tickets.put(c.companyId, out); return out;
+        // WSAA rechaza pedir un ticket nuevo mientras el anterior siga vigente (dura ~12 h): se usa el vencimiento real que informa ARCA.
+        Instant exp = now.plusSeconds(540);
+        String expText = first(ticket, "expirationTime");
+        if (!expText.isBlank()) {
+            try { exp = java.time.OffsetDateTime.parse(expText).toInstant(); } catch (Exception ignored) { /* conserva el valor conservador */ }
+        }
+        Ticket out = new Ticket(token, sign, exp, env); tickets.put(c.companyId, out); return out;
     }
 
     private String authXml(Ticket t, FiscalConfig c) { return "<ar:Token>"+xmlEscape(t.token)+"</ar:Token><ar:Sign>"+xmlEscape(t.sign)+"</ar:Sign><ar:Cuit>"+c.cuit.replaceAll("[^0-9]", "")+"</ar:Cuit>"; }

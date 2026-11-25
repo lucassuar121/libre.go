@@ -142,6 +142,12 @@ public class Api {
     }
 
     // ---------- límites de intentos (anti fuerza bruta / spam) ----------
+    /** En la empresa de demostración (acceso público) no se tocan usuarios ni contraseñas. */
+    private void denyDemo(AppUser u) {
+        if (u != null && u.companyId != null && cos.findById(u.companyId).map(c -> Boolean.TRUE.equals(c.demo)).orElse(false))
+            throw err(403, "En la demostración no se pueden crear, borrar ni cambiar usuarios o contraseñas.");
+    }
+
     boolean tooMany(String key, int max, long windowSeconds) {
         List<Instant> l = hits.get(key);
         if (l == null) return false;
@@ -335,6 +341,22 @@ public class Api {
         return bootFor(u);
     }
 
+    /** Acceso público de un clic a la empresa de demostración (datos ficticios, sin cobros ni facturación fiscal). */
+    @PostMapping("/public/demo/enter")
+    public Map<String, Object> demoEnter(@RequestBody(required = false) Map<String,Object> body, HttpSession s) {
+        String ikey = "demoenter|" + ip();
+        if (tooMany(ikey, 30, 900)) throw err(429, "Demasiados accesos a la demostración. Probá de nuevo en unos minutos.");
+        hit(ikey);
+        Company demo = cos.findAll().stream().filter(c -> Boolean.TRUE.equals(c.demo)).findFirst()
+                .orElseThrow(() -> err(503, "La demostración todavía no está preparada."));
+        String role = str(body == null ? null : body.get("role")).equals("empleado") ? "empleado" : "jefe";
+        AppUser u = users.findByCompanyId(demo.id).stream().filter(x -> role.equals(x.role))
+                .sorted(Comparator.comparing(x -> x.username)).findFirst()
+                .orElseThrow(() -> err(503, "La cuenta de demostración no está preparada."));
+        req.changeSessionId(); s.setAttribute("demoGate", true); s.setAttribute("uid", u.id);
+        return bootFor(u);
+    }
+
     /** Cambia entre las cuentas demo solo dentro de una sesión que ya inició sesión con una cuenta demo. */
     @PostMapping("/public/demo/login")
     public Map<String, Object> demoLogin(@RequestBody(required = false) Map<String,Object> body, HttpSession s) {
@@ -406,6 +428,7 @@ public class Api {
     @PostMapping("/auth/password")
     public Map<String, Object> changePassword(@RequestBody Map<String, Object> b, HttpSession s) {
         AppUser u = real(s);
+        denyDemo(u);
         if (!enc.matches(str(b.get("current")), u.passHash)) throw err(400, "La contraseña actual no es correcta.");
         String pw = str(b.get("password"));
         if (pw.length() < MINPW) throw err(400, PWMSG);
@@ -1850,6 +1873,7 @@ public class Api {
     @PostMapping("/users")
     public Map<String, Object> newUser(@RequestBody Map<String, Object> b, HttpSession s) {
         AppUser j = boss(s);
+        denyDemo(j);
         String n = str(b.get("name")), un = str(b.get("username")).toLowerCase(), pw = str(b.get("password"));
         String role = "jefe".equals(str(b.get("role"))) ? "jefe" : "empleado"; // nunca se puede crear un "global"
         if (n.isEmpty() || un.isEmpty()) throw err(400, "Completá nombre y usuario.");
@@ -1883,6 +1907,7 @@ public class Api {
     @PutMapping("/users/{id}/role")
     public Map<String, Object> toggleRole(@PathVariable Long id, HttpSession s) {
         AppUser j = boss(s);
+        denyDemo(j);
         AppUser t = target(j, id);
         if (t.id.equals(j.id)) throw err(400, "No podés cambiar tu propio rol.");
         t.role = isBoss(t) ? "empleado" : "jefe";
@@ -1894,6 +1919,7 @@ public class Api {
     @PostMapping("/users/{id}/password")
     public Map<String, Object> setPassword(@PathVariable Long id, @RequestBody Map<String, Object> b, HttpSession s) {
         AppUser j = boss(s);
+        denyDemo(j);
         AppUser t = target(j, id);
         String pw = str(b.get("password"));
         if (pw.length() < MINPW) throw err(400, PWMSG);
@@ -1906,6 +1932,7 @@ public class Api {
     @DeleteMapping("/users/{id}")
     public Map<String, Object> deleteUser(@PathVariable Long id, HttpSession s) {
         AppUser j = boss(s);
+        denyDemo(j);
         AppUser t = target(j, id);
         if (t.id.equals(j.id)) throw err(400, "No podés eliminar tu propio usuario.");
         users.delete(t);
