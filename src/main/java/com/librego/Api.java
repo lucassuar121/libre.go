@@ -142,6 +142,9 @@ public class Api {
     }
 
     // ---------- límites de intentos (anti fuerza bruta / spam) ----------
+    /** Importe en pesos con separador de miles, igual que se ve en pantalla (ej.: $ 3.200). */
+    static String ars(double v) { return "$ " + String.format(java.util.Locale.forLanguageTag("es-AR"), "%,d", Math.round(v)); }
+
     /** En la empresa de demostración (acceso público) no se tocan usuarios ni contraseñas. */
     private void denyDemo(AppUser u) {
         if (u != null && u.companyId != null && cos.findById(u.companyId).map(c -> Boolean.TRUE.equals(c.demo)).orElse(false))
@@ -632,6 +635,28 @@ public class Api {
         return ok();
     }
 
+    /** Alta manual de una empresa (sin pago de Mercado Pago): solo el administrador global. La contraseña la define quien lo hace. */
+    @PostMapping("/admin/companies")
+    public Map<String, Object> createCompany(@RequestBody Map<String, Object> b, HttpSession s) {
+        AppUser g = global(s);
+        String co = cut(str(b.get("company")), 120), name = cut(str(b.get("name")), 120), un = str(b.get("username")).toLowerCase();
+        String em = str(b.get("email")).toLowerCase(), pw = str(b.get("password"));
+        if (co.isEmpty() || name.isEmpty() || un.isEmpty() || em.isEmpty()) throw err(400, "Completá todos los campos.");
+        if (un.length() > 50 || em.length() > 150) throw err(400, "Alguno de los datos es demasiado largo.");
+        if (!em.matches(EMAIL)) throw err(400, "Ingresá un email válido.");
+        if (pw.length() < MINPW) throw err(400, PWMSG);
+        if (users.findByUsername(un).isPresent()) throw err(400, "Ese usuario ya existe. Probá con otro.");
+        if (users.findByEmailIgnoreCase(em).isPresent()) throw err(400, "Ese email ya tiene una cuenta.");
+        Company c = new Company(); c.name = co; c.subStatus = "ACTIVA"; c.subStart = Instant.now();
+        c.subExpires = c.subStart.atZone(ZoneId.of(tz)).plusMonths(1).toInstant();
+        c = cos.save(c);
+        mk(c.id, "companyconfig", new LinkedHashMap<>(Map.of("counters", 1, "cashBalances", List.of(0.0))));
+        AppUser u = new AppUser(); u.companyId = c.id; u.name = name; u.username = un; u.email = em; u.passHash = enc.encode(pw); u.role = "jefe";
+        users.save(u);
+        audit.record(c.id, c.name, "COMPANY_CREATED_BY_ADMIN", "Alta manual por " + g.username + ".");
+        return ok();
+    }
+
     /** Eliminar una empresa completa: solo el administrador global y con confirmación explícita. Afecta únicamente a esa empresa. */
     @DeleteMapping("/admin/companies/{id}")
     public Map<String, Object> deleteCompany(@PathVariable Long id, @RequestBody(required = false) Map<String, Object> b, HttpSession s) {
@@ -1060,7 +1085,7 @@ public class Api {
         sale.put("saleType", photocopy ? (items.stream().anyMatch(it -> it.get("productId") != null) ? "MIXTA" : "FOTOCOPIAS") : "PRODUCTOS");
         if (photocopy) sale.put("photocopy", copyDetails);
         Map<String, Object> out = rd(mk(c, "sales", sale));
-        log(u, "Registró la venta #" + pad(number) + " por $" + Math.round(total) + " (" + pay + ") a " + clientName);
+        log(u, "Registró la venta #" + pad(number) + " por " + ars(total) + " (" + pay + ") a " + clientName);
 
         // factura por email (PDF adjunto + detalle en el cuerpo), con la misma configuración de Gmail
         String company = cos.findById(c).map(x -> x.name).orElse("");
@@ -1173,7 +1198,7 @@ public class Api {
         if (cashShiftId != null && paymentMethod.equals("efectivo")) pu.put("cashShiftId", cashShiftId);
         pu.put("userId", u.id); pu.put("user", u.name);
         Map<String, Object> out = rd(mk(c, "purchases", pu));
-        log(u, "Registró la compra #" + pad(number) + " a " + supplierName + " por $" + Math.round(total.doubleValue()) + " · pago: " + (paymentMethod.equals("pendiente") ? "cuenta corriente" : paymentMethod));
+        log(u, "Registró la compra #" + pad(number) + " a " + supplierName + " por " + ars(total.doubleValue()) + " · pago: " + (paymentMethod.equals("pendiente") ? "cuenta corriente" : paymentMethod));
         return out;
     }
 
@@ -1205,7 +1230,7 @@ public class Api {
         purchase.remove("cashShiftId");
         if (cashShiftId != null && method.equals("efectivo")) purchase.put("cashShiftId", cashShiftId);
         wr(rec, purchase);
-        log(u, "Registró el pago de la compra #" + pad(num(purchase.get("number"))) + " por $" + Math.round(dbl(purchase.get("total"))) + " mediante " + method);
+        log(u, "Registró el pago de la compra #" + pad(num(purchase.get("number"))) + " por " + ars(dbl(purchase.get("total"))) + " mediante " + method);
         return purchase;
     }
 
@@ -1281,8 +1306,8 @@ public class Api {
         rec.put("userId", u.id); rec.put("user", u.name); rec.put("username", u.username); rec.put("start", Instant.now().toString()); rec.put("counter", counter); rec.put("openingCash", openingCash); rec.put("expectedOpeningCash", expectedOpeningCash); rec.put("openingDifference", openingDifference);
         if (def != null) stampDef(rec, def);
         mk(u.companyId, "shifts", rec);
-        log(u, "Fichó la entrada en el mostrador " + counter + (def != null ? " (turno " + def.get("name") + ")" : "") + "; saldo contado $" + Math.round(openingCash));
-        if (Math.abs(openingDifference) > 0.001) log(u, "ALERTA DE CAJA: el saldo inicial del mostrador " + counter + " no coincide con el cierre anterior. Esperado $" + Math.round(expectedOpeningCash) + ", contado $" + Math.round(openingCash) + ", diferencia $" + Math.round(openingDifference));
+        log(u, "Fichó la entrada en el mostrador " + counter + (def != null ? " (turno " + def.get("name") + ")" : "") + "; saldo contado " + ars(openingCash));
+        if (Math.abs(openingDifference) > 0.001) log(u, "ALERTA DE CAJA: el saldo inicial del mostrador " + counter + " no coincide con el cierre anterior. Esperado " + ars(expectedOpeningCash) + ", contado " + ars(openingCash) + ", diferencia " + ars(openingDifference));
         return Map.of("ok", true, "openingCash", openingCash, "expectedOpeningCash", expectedOpeningCash, "openingDifference", openingDifference);
     }
 
@@ -1331,9 +1356,9 @@ public class Api {
         sh.put("diffCash", diffCash); sh.put("diffCard", diffCard); sh.put("diffQr", diffQr); sh.put("diffTransfer", diffTransfer); sh.put("diffTotal", diffTotal); sh.put("diff", diffCash);
         sh.put("cashReconciled", Math.abs(diffTotal) < 0.001 && Math.abs(dbl(sh.get("openingDifference"))) < 0.001);
         wr(r, sh);
-        String summary = "Cerró caja. Diferencias: efectivo $"+Math.round(diffCash)+", tarjeta $"+Math.round(diffCard)+", QR $"+Math.round(diffQr)+", transferencia $"+Math.round(diffTransfer);
+        String summary = "Cerró caja. Diferencias: efectivo " + ars(diffCash)+", tarjeta " + ars(diffCard)+", QR " + ars(diffQr)+", transferencia " + ars(diffTransfer);
         log(u, summary);
-        if (diffTotal > 0.001 || Math.abs(dbl(sh.get("openingDifference"))) > 0.001) log(u, "ALERTA DE CIERRE DE CAJA: revisar el turno de "+u.name+" en mostrador "+sh.get("counter")+". Diferencia total absoluta $"+Math.round(diffTotal));
+        if (diffTotal > 0.001 || Math.abs(dbl(sh.get("openingDifference"))) > 0.001) log(u, "ALERTA DE CIERRE DE CAJA: revisar el turno de "+u.name+" en mostrador "+sh.get("counter")+". Diferencia total absoluta " + ars(diffTotal));
         return sh;
     }
 
@@ -1364,7 +1389,7 @@ public class Api {
         if (amount > available) throw err(400, "El retiro supera el efectivo esperado disponible en ese mostrador (" + Math.round(Math.max(0,available)) + ").");
         Map<String,Object> rec = new LinkedHashMap<>(); rec.put("at",Instant.now().toString()); rec.put("userId",u.id); rec.put("user",u.name); rec.put("shiftId",sh.get("id")); rec.put("counter",sh.get("counter")); rec.put("amount",amount); rec.put("reason",reason);
         mk(u.companyId,"withdrawals",rec);
-        log(u,"Retiró $"+Math.round(amount)+" de caja del mostrador "+sh.get("counter")+": "+reason);
+        log(u,"Retiró " + ars(amount)+" de caja del mostrador "+sh.get("counter")+": "+reason);
         return rec;
     }
 
@@ -1399,7 +1424,7 @@ public class Api {
         sh.put("cashReconciled",Math.abs(diffTotal)<0.001 && Math.abs(dbl(sh.get("openingDifference")))<0.001);
         sh.put("editedBy",u.name); sh.put("editedAt",Instant.now().toString()); sh.put("editNote",str(b.get("note")));
         wr(r,sh);
-        log(u,"Corrigió el cierre de caja de "+str(sh.get("user"))+". Diferencia recalculada: $"+Math.round(diffTotal)+". Nota: "+str(b.get("note")));
+        log(u,"Corrigió el cierre de caja de "+str(sh.get("user"))+". Diferencia recalculada: " + ars(diffTotal)+". Nota: "+str(b.get("note")));
         return sh;
     }
 

@@ -18,7 +18,7 @@ import java.util.*;
 /** Crea y mantiene una empresa de muestra aislada, con datos ficticios coherentes para recorrer todos los módulos. */
 @Component
 public class DemoSeeder implements ApplicationRunner {
-    private static final int DEMO_VERSION = 3;
+    private static final int DEMO_VERSION = 4;
     private static final ZoneId ZONE = ZoneId.of("America/Argentina/Cordoba");
     @Value("${demo.boss.username:demo_jefe}") private String bossUsername;
     @Value("${demo.boss.password:DemoJefe2026!}") private String bossPassword;
@@ -66,25 +66,31 @@ public class DemoSeeder implements ApplicationRunner {
         }
     }
 
+    /** Convierte "Agustina Molina" en "agustina.molina" para armar correos de ejemplo. */
+    private static String emailOf(String name) {
+        String n = java.text.Normalizer.normalize(name, java.text.Normalizer.Form.NFD).replaceAll("\\p{M}", "");
+        return n.toLowerCase(Locale.ROOT).trim().replaceAll("[^a-z0-9]+", ".");
+    }
+
     private List<AppUser> ensureUsers(Long cid) {
         List<AppUser> team = users.findByCompanyId(cid);
         AppUser boss = team.stream().filter(u -> "jefe".equals(u.role)).findFirst().orElseGet(() -> {
             AppUser u = new AppUser(); u.companyId = cid; u.role = "jefe"; return u;
         });
         boss.name = "María González"; boss.username = reserveUsername(bossUsername, cid, boss.id);
-        boss.email = "jefe@demo.librego.invalid"; boss.passHash = encoder.encode(bossPassword); boss.role = "jefe";
+        boss.email = "jefe.demo@example.com"; boss.passHash = encoder.encode(bossPassword); boss.role = "jefe";
         boss = users.save(boss);
 
         AppUser employee = team.stream().filter(u -> "empleado".equals(u.role)).findFirst().orElseGet(() -> {
             AppUser u = new AppUser(); u.companyId = cid; u.role = "empleado"; return u;
         });
         employee.name = "Tomás Pérez"; employee.username = reserveUsername(employeeUsername, cid, employee.id);
-        employee.email = "empleado@demo.librego.invalid"; employee.passHash = encoder.encode(employeePassword); employee.role = "empleado";
+        employee.email = "empleado.demo@example.com"; employee.passHash = encoder.encode(employeePassword); employee.role = "empleado";
         employee = users.save(employee);
 
-        ensureEmployee(cid, "demo_empleado2", "Lucía Fernández", "empleado2@demo.librego.invalid");
-        ensureEmployee(cid, "demo_empleado3", "Mateo Romero", "empleado3@demo.librego.invalid");
-        ensureEmployee(cid, "demo_empleado4", "Camila Torres", "empleado4@demo.librego.invalid");
+        ensureEmployee(cid, "demo_empleado2", "Lucía Fernández", "empleado2.demo@example.com");
+        ensureEmployee(cid, "demo_empleado3", "Mateo Romero", "empleado3.demo@example.com");
+        ensureEmployee(cid, "demo_empleado4", "Camila Torres", "empleado4.demo@example.com");
         return users.findByCompanyId(cid);
     }
 
@@ -152,13 +158,13 @@ public class DemoSeeder implements ApplicationRunner {
 
         List<Map<String,Object>> clients = new ArrayList<>();
         String[] clientNames = {"Sofía Martínez","Diego Fernández","Valentina López","Martín Castro","Julieta Herrera","Bruno Gómez","Camila Díaz","Nicolás Romero","Agustina Molina","Facundo Torres","Milagros Acosta","Pedro Sosa"};
-        for (int i=0;i<clientNames.length;i++) clients.add(map("name",clientNames[i],"email","cliente"+(i+1)+"@example.invalid","phone","351-555-"+String.format("%04d",101+i),"notes",i%3==0?"Cliente frecuente (datos ficticios)":""));
+        for (int i=0;i<clientNames.length;i++) clients.add(map("name",clientNames[i],"email",emailOf(clientNames[i])+"@example.com","phone","351-555-"+String.format("%04d",101+i),"notes",i%3==0?"Cliente frecuente (datos ficticios)":""));
         List<Long> clientIds = new ArrayList<>(); for (Map<String,Object> c:clients) clientIds.add(save(cid,"clients",c));
 
         List<Map<String,Object>> suppliers = new ArrayList<>();
         String[][] sup = {{"Distribuidora Central","Ana Torres"},{"Editorial del Centro","Pablo Díaz"},{"Mayorista Escolar Córdoba","Micaela Luna"},{"Libros del Parque","Sergio Gil"},{"Papelera Norte","Romina Paz"},{"Ediciones Horizonte","Federico Rey"},{"Comercial San Martín","Laura Vera"},{"Distribuciones Sierras","Andrés Ortiz"}};
         List<Long> supplierIds = new ArrayList<>();
-        for(int i=0;i<sup.length;i++) supplierIds.add(save(cid,"suppliers",map("name",sup[i][0]+" (demo)","contact",sup[i][1],"phone","351-555-"+String.format("%04d",201+i),"email","ventas"+(i+1)+"@proveedor.example.invalid","website","https://example.invalid","notes","Proveedor ficticio para demostración")));
+        for(int i=0;i<sup.length;i++) supplierIds.add(save(cid,"suppliers",map("name",sup[i][0],"contact",sup[i][1],"phone","351-555-"+String.format("%04d",201+i),"email","ventas"+(i+1)+"@proveedor.example.com","website","https://example.com","notes","Proveedor ficticio para demostración")));
 
         // La demo tiene dos mostradores operativos, con fondos iniciales independientes.
         // Esto permite que dos empleados trabajen en paralelo sin compartir una caja abierta.
@@ -199,10 +205,13 @@ public class DemoSeeder implements ApplicationRunner {
         Map<String,Long> shiftCache = new HashMap<>();
         List<Map<String,Object>> saleRows = new ArrayList<>();
         List<Map<String,Object>> movementRows = new ArrayList<>();
-        int number=1;
-        for (int[] s:specs) {
+        int number=1, todayCount=0;
+        // Se cargan de la más antigua a la más reciente para que la numeración de ventas sea cronológica.
+        List<int[]> orderedSpecs = new ArrayList<>(Arrays.asList(specs));
+        orderedSpecs.sort((a,b)->Integer.compare(b[0],a[0]));
+        for (int[] s:orderedSpecs) {
             LocalDate date = LocalDate.now(ZONE).minusDays(s[0]);
-            AppUser user = s[2]==0 ? boss : employees.get((s[2]-1)%employees.size());
+            AppUser user = employees.get(s[2]==0 ? 1 % employees.size() : (s[2]-1)%employees.size()); // el jefe no vende en mostrador
             int hour=s[1], counter=s[3], turn=s[4]; long defId=turn==0?morningId:eveningId;
             String shiftName=turn==0?"Mañana":"Tarde/Noche";
             String key=date+"|"+user.id+"|"+counter+"|"+turn;
@@ -215,7 +224,8 @@ public class DemoSeeder implements ApplicationRunner {
                 Map<String,Object> sh=map("start",start.toString(),"end",end==null?null:end.toString(),"userId",user.id,"user",user.name,"counter",counter,"shiftDefId",defId,"shiftName",shiftName,"shiftFrom",turn==0?"08:00":"14:00","shiftTo",turn==0?"14:00":"22:00","diff",0,"diffNote","Cierre de ejemplo");
                 shiftId=save(cid,"shifts",sh); shiftCache.put(key,shiftId);
             }
-            Instant at=s[0]==0 ? now.minus((4-number)*25L,ChronoUnit.MINUTES) : date.atTime(hour,10+(number%4)*10).atZone(ZONE).toInstant();
+            if (s[0]==0) todayCount++;
+            Instant at=s[0]==0 ? now.minus((4-todayCount)*25L,ChronoUnit.MINUTES) : date.atTime(hour,10+(number%4)*10).atZone(ZONE).toInstant();
             int pidx=s[7], qty=s[8]; double price=Double.parseDouble(products[pidx][5]), cost=Double.parseDouble(products[pidx][4]);
             String payment=new String[]{"efectivo","tarjeta","qr"}[number%3];
             String clientName=clientNames[s[5]%clientNames.length];
@@ -228,11 +238,12 @@ public class DemoSeeder implements ApplicationRunner {
             number++;
         }
 
+        Arrays.sort(purchases,(a,b)->Integer.compare(b[0],a[0]));
         for(int i=0;i<purchases.length;i++) {
             int[] p=purchases[i]; LocalDate date=LocalDate.now(ZONE).minusDays(p[0]);
             AppUser user=employees.get(i%employees.size()); long prodIdx=p[1], qty=p[2];
             double buy=Double.parseDouble(products[(int)prodIdx][4]);
-            String supplierName=sup[(i+1)%sup.length][0]+" (demo)";
+            String supplierName=sup[(i+1)%sup.length][0];
             Instant at=date.atTime(9+i%4,15).atZone(ZONE).toInstant();
             save(cid,"purchases",map("number",i+1,"date",date.toString(),"at",at.toString(),"supplierId",supplierIds.get((i+1)%supplierIds.size()),"supplierName",supplierName,"invoice","DEMO-"+String.format("%04d",i+1),"notes","Compra ficticia para mostrar el módulo.","items",List.of(map("productId",productIds.get((int)prodIdx),"title",products[(int)prodIdx][0],"qty",qty,"unitPrice",buy,"subtotal",qty*buy)),"total",qty*buy,"status","REGISTRADA","paymentMethod",(i%3==0?"efectivo":i%3==1?"transferencia":"pendiente"),"paymentStatus",(i%3==2?"PENDIENTE":"PAGADA"),"paidAt",(i%3==2?null:at.toString()),"requestId","demo-purchase-"+(i+1),"userId",boss.id,"user",boss.name));
             movementRows.add(map("at",at.toString(),"productIndex",prodIdx,"productId",productIds.get((int)prodIdx),"title",products[(int)prodIdx][0],"type","entrada","qty",qty,"delta",qty,"reason","Compra a "+supplierName,"userId",boss.id,"user",boss.name));
