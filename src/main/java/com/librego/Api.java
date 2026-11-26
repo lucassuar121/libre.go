@@ -855,6 +855,99 @@ public class Api {
         return ok();
     }
 
+    private static String impKey(String s) {
+        return java.text.Normalizer.normalize(s == null ? "" : s, java.text.Normalizer.Form.NFD).replaceAll("\\p{M}", "").toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", " ").trim();
+    }
+
+    /** Lee un número de la fila importada; null si la celda vino vacía. */
+    private static Double impNum(Object o, String label) {
+        if (o == null || String.valueOf(o).isBlank()) return null;
+        double d;
+        try { d = o instanceof Number n ? n.doubleValue() : Double.parseDouble(String.valueOf(o).trim()); }
+        catch (NumberFormatException e) { throw err(400, "\"" + label + "\" no es un número válido."); }
+        if (!Double.isFinite(d)) throw err(400, "\"" + label + "\" no es un número válido.");
+        if (d < 0) throw err(400, "\"" + label + "\" no puede ser negativo.");
+        if (d > 1_000_000_000d) throw err(400, "\"" + label + "\" es demasiado grande.");
+        return d;
+    }
+
+    /**
+     * Importación masiva de productos desde un Excel o CSV que el navegador ya leyó. Solo el jefe.
+     * Cada fila se valida por separado: las inválidas se informan y no frenan al resto. Si el producto ya existe
+     * (mismo código/ISBN o mismo título y autor) se omite o se actualiza según "duplicates" ("skip" o "update").
+     */
+    @PostMapping("/stock/import")
+    public Map<String, Object> stockImport(@RequestBody Map<String, Object> b, HttpSession s) {
+        AppUser u = boss(s);
+        if (cos.findById(u.companyId).map(c -> Boolean.TRUE.equals(c.demo)).orElse(false))
+            throw err(403, "En la demostración no se puede importar un Excel. Es una empresa de ejemplo compartida.");
+        lockCompany(u.companyId);
+        if (!(b.get("rows") instanceof List<?> rows) || rows.isEmpty()) throw err(400, "El archivo no tiene productos para importar.");
+        if (rows.size() > 2000) throw err(400, "Podés importar hasta 2.000 productos por vez. Dividí el archivo en partes.");
+        boolean update = "update".equals(str(b.get("duplicates")));
+        Map<String, Map<String, Object>> byCode = new HashMap<>(), byName = new HashMap<>();
+        for (Map<String, Object> p : list(u.companyId, "products")) {
+            String c = impKey(str(p.get("isbn")));
+            if (!c.isEmpty()) byCode.putIfAbsent(c, p);
+            byName.putIfAbsent(impKey(str(p.get("title"))) + "|" + impKey(str(p.get("author"))), p);
+        }
+        Set<String> seen = new HashSet<>();
+        List<Map<String, Object>> errors = new ArrayList<>(), skipped = new ArrayList<>();
+        int created = 0, updated = 0;
+        int idx = 0;
+        for (Object ro : rows) {
+            idx++;
+            if (!(ro instanceof Map<?, ?> row)) continue;
+            long rowNo = row.get("row") instanceof Number n ? n.longValue() : idx + 1L;
+            String title = cut(str(row.get("title")), 200);
+            try {
+                if (title.isEmpty()) throw err(400, "Falta el título del producto.");
+                String author = cut(str(row.get("author")), 150), code = cut(str(row.get("isbn")), 60), category = cut(str(row.get("category")), 80);
+                String type = cut(str(row.get("type")), 60);
+                Double buy = impNum(row.get("buyPrice"), "Precio de compra"), sell = impNum(row.get("sellPrice"), "Precio de venta");
+                Double iva = impNum(row.get("ivaRate"), "IVA"), stk = impNum(row.get("stock"), "Stock");
+                if (iva != null && iva > 100) throw err(400, "El IVA debe estar entre 0 y 100.");
+                long units = stk == null ? 0 : Math.round(stk);
+                String nameKey = impKey(title) + "|" + impKey(author), codeKey = impKey(code);
+                String dupKey = codeKey.isEmpty() ? nameKey : "c:" + codeKey;
+                if (!seen.add(dupKey)) throw err(400, "Este producto está repetido dentro del archivo.");
+                Map<String, Object> match = !codeKey.isEmpty() && byCode.containsKey(codeKey) ? byCode.get(codeKey) : byName.get(nameKey);
+                if (match != null) {
+                    if (!update) { skipped.add(Map.of("row", rowNo, "title", title, "message", "Ya existe en tu inventario.")); continue; }
+                    Rec r = find(u.companyId, "products", match.get("id"));
+                    Map<String, Object> m = rd(r);
+                    long before = num(m.getOrDefault("stock", 0L));
+                    if (buy != null) m.put("buyPrice", (double) Math.round(buy));
+                    if (sell != null) m.put("sellPrice", (double) Math.round(sell));
+                    if (iva != null) m.put("ivaRate", iva);
+                    if (str(m.get("author")).isEmpty() && !author.isEmpty()) m.put("author", author);
+                    if (str(m.get("isbn")).isEmpty() && !code.isEmpty()) m.put("isbn", code);
+                    if (str(m.get("category")).isEmpty() && !category.isEmpty()) m.put("category", category);
+                    m.put("stock", before + units);
+                    wr(r, m);
+                    if (units > 0) move(u, r.id, str(m.get("title")), "entrada", units, before, before + units, "Importación desde Excel");
+                    updated++;
+                } else {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("type", type.isEmpty() ? "libro" : type); m.put("title", title); m.put("author", author); m.put("isbn", code); m.put("category", category);
+                    m.put("buyPrice", (double) Math.round(buy == null ? 0 : buy)); m.put("sellPrice", (double) Math.round(sell == null ? 0 : sell));
+                    m.put("ivaRate", iva == null ? 21.0 : iva); m.put("stock", units);
+                    Rec r = mk(u.companyId, "products", m);
+                    if (units > 0) move(u, r.id, title, "entrada", units, 0, units, "Importación desde Excel");
+                    created++;
+                }
+            } catch (ResponseStatusException ex) {
+                errors.add(Map.of("row", rowNo, "title", title, "message", String.valueOf(ex.getReason())));
+            }
+        }
+        log(u, "Importó productos desde Excel: " + created + " nuevos, " + updated + " actualizados, " + skipped.size() + " omitidos, " + errors.size() + " con errores.");
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("ok", true); out.put("created", created); out.put("updated", updated);
+        out.put("skipped", skipped.size()); out.put("skippedList", skipped.stream().limit(100).toList());
+        out.put("errors", errors.size()); out.put("errorList", errors.stream().limit(100).toList());
+        return out;
+    }
+
     @PostMapping("/stock/move")
     public Map<String, Object> stockMove(@RequestBody Map<String, Object> b, HttpSession s) {
         AppUser u = me(s);
