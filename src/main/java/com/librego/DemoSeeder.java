@@ -74,14 +74,18 @@ public class DemoSeeder implements ApplicationRunner {
 
     private List<AppUser> ensureUsers(Long cid) {
         List<AppUser> team = users.findByCompanyId(cid);
-        AppUser boss = team.stream().filter(u -> "jefe".equals(u.role)).findFirst().orElseGet(() -> {
+        AppUser boss = team.stream().filter(u -> bossUsername.equals(u.username)).findFirst()
+                .or(() -> team.stream().filter(u -> "jefe".equals(u.role)).findFirst()).orElseGet(() -> {
             AppUser u = new AppUser(); u.companyId = cid; u.role = "jefe"; return u;
         });
         boss.name = "María González"; boss.username = reserveUsername(bossUsername, cid, boss.id);
         boss.email = "jefe.demo@example.com"; boss.passHash = encoder.encode(bossPassword); boss.role = "jefe";
         boss = users.save(boss);
 
-        AppUser employee = team.stream().filter(u -> "empleado".equals(u.role)).findFirst().orElseGet(() -> {
+        // El empleado principal se busca por su usuario: hay varios empleados con el mismo rol y elegir "el primero" puede tomar a otro.
+        Set<String> extras = Set.of("demo_empleado2", "demo_empleado3", "demo_empleado4");
+        AppUser employee = team.stream().filter(u -> employeeUsername.equals(u.username)).findFirst()
+                .or(() -> team.stream().filter(u -> "empleado".equals(u.role) && !extras.contains(u.username)).findFirst()).orElseGet(() -> {
             AppUser u = new AppUser(); u.companyId = cid; u.role = "empleado"; return u;
         });
         employee.name = "Tomás Pérez"; employee.username = reserveUsername(employeeUsername, cid, employee.id);
