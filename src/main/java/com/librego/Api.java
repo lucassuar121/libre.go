@@ -302,7 +302,27 @@ public class Api {
         SignupIntent in = signupIntents.findByTokenHash(sha(token)).orElseThrow(() -> err(404, "No encontramos esta contratación. Volvé a iniciar el proceso."));
         if (in.expiresAt != null && in.expiresAt.isBefore(Instant.now()) && !"PAID".equals(in.status) && !"COMPLETED".equals(in.status))
             throw err(410, "Esta contratación venció. Iniciá una nueva contratación.");
+        if ("PENDING".equals(in.status) && in.mpPreapprovalId != null && !in.mpPreapprovalId.isEmpty()) verifySignupWithMp(in);
         return Map.of("status", in.status, "paid", "PAID".equals(in.status), "completed", "COMPLETED".equals(in.status), "amount", in.amount == null ? price : in.amount, "currency", "ARS");
+    }
+
+    /**
+     * Respaldo del webhook: si el aviso de Mercado Pago no llegó, se consulta la suscripción directamente a Mercado Pago (fuente confiable,
+     * no el navegador). Solo se da por pagada si está "authorized", coincide la referencia y el importe, y no hay cobros rechazados.
+     */
+    private void verifySignupWithMp(SignupIntent in) {
+        try {
+            Map<String, Object> pre = mp.getPreapproval(in.mpPreapprovalId);
+            if (pre == null || !"authorized".equals(str(pre.get("status")))) return;
+            if (!in.externalReference.equals(str(pre.get("external_reference")))) return;
+            if (!(pre.get("auto_recurring") instanceof Map<?, ?> ar) || ar.get("transaction_amount") == null) return;
+            if (new BigDecimal(String.valueOf(ar.get("transaction_amount"))).compareTo(in.amount) != 0 || !"ARS".equals(str(ar.get("currency_id")))) return;
+            in.status = "PAID"; in.mpStatus = "authorized"; in.paidAt = Instant.now();
+            signupIntents.save(in);
+            LOG.info("Contratación {} confirmada consultando a Mercado Pago (sin aviso).", in.externalReference);
+        } catch (Exception e) {
+            LOG.warn("Mercado Pago (verificar contratación {}): {}", in.externalReference, e.getMessage());
+        }
     }
 
     /** Crea la empresa y el primer usuario solamente después de que el webhook haya marcado el pago como aprobado. */
